@@ -186,6 +186,51 @@ impl FileOrganizer {
         Ok(target_path)
     }
 
+    /// 把已经解压到临时目录的字幕或字体放进目标位置。
+    ///
+    /// 临时文件会被多集共用，因此这里只复制或硬链接，不删除源文件。
+    /// 硬链接失败时改为复制。目标若是符号链接，先删除链接本身再写入。
+    pub fn place_extracted_asset(
+        source: &Path,
+        target: &Path,
+        mode: OperationMode,
+        dry_run: bool,
+    ) -> Result<()> {
+        if dry_run {
+            println!("[DRY-RUN] {} -> {}", source.display(), target.display());
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(target) {
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(target)?;
+            } else if metadata.is_file() {
+                if Self::files_match(source, target)? {
+                    return Ok(());
+                }
+                fs::remove_file(target)?;
+            } else {
+                return Err(AppError::FileOperation {
+                    path: target.to_path_buf(),
+                    message: "提取资产的目标不是普通文件".to_string(),
+                });
+            }
+        }
+        match mode {
+            OperationMode::Link => {
+                if Self::create_hard_link(source, target).is_err() {
+                    fs::copy(source, target)?;
+                }
+            }
+            OperationMode::Copy | OperationMode::Move => {
+                fs::copy(source, target)?;
+            }
+        }
+        Ok(())
+    }
+
     /// 从最深层开始删除根目录下的空目录，保留根目录本身。
     pub fn cleanup_empty_directories<P: AsRef<Path>>(
         root: P,

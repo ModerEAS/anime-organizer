@@ -60,6 +60,14 @@ pub(crate) struct OrganizeArgs {
     #[arg(long)]
     pub(crate) dry_run: bool,
 
+    /// 成功把压缩包里的字幕或字体放进目标目录后，删除源压缩包
+    #[arg(long)]
+    pub(crate) delete_extracted_archives: bool,
+
+    /// 提取后用 Windows Defender 扫描临时目录；未通过则丢弃该压缩包
+    #[arg(long)]
+    pub(crate) scan_extracted_archives: bool,
+
     /// 包含的扩展名（逗号分隔，默认：mp4,mkv,avi,mov,wmv,flv,rmvb）
     #[arg(long, value_name = "EXT", value_delimiter = ',')]
     pub(crate) include_ext: Option<Vec<String>>,
