@@ -1327,11 +1327,16 @@ mod tests {
     }
 
     #[test]
-    fn defender_scan_reports_unsupported_without_an_executable() {
-        assert!(matches!(
-            scan_extracted_directory_with(Path::new("."), None),
-            DefenderScan::Unsupported
-        ));
+    fn defender_scan_without_an_executable_follows_the_platform() {
+        let result = scan_extracted_directory_with(Path::new("."), None);
+        if cfg!(windows) {
+            assert!(matches!(
+                result,
+                DefenderScan::Failed(message) if message.contains("MpCmdRun.exe")
+            ));
+        } else {
+            assert!(matches!(result, DefenderScan::Unsupported));
+        }
     }
 
     fn walk_has_executable(root: &Path) -> bool {
