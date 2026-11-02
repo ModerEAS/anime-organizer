@@ -15,7 +15,7 @@ use axum::extract::{DefaultBodyLimit, Json, Path, Query, State};
 use axum::http::{header, HeaderValue, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-#[cfg(feature = "clouddrive")]
+#[cfg(any(feature = "clouddrive", feature = "self-update"))]
 use axum::routing::put;
 use axum::routing::{delete, get, post};
 use axum::{response::IntoResponse, Router};
@@ -40,6 +40,16 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
             "/api/v1/jobs/:id/artifacts/:artifact_id",
             get(download_artifact),
         );
+    #[cfg(feature = "self-update")]
+    {
+        router = router
+            .route(
+                "/api/v1/app-update/settings",
+                put(update_app_update_settings),
+            )
+            .route("/api/v1/app-update/check", post(check_app_update))
+            .route("/api/v1/app-update/apply", post(apply_app_update));
+    }
     #[cfg(feature = "clouddrive")]
     {
         router = router
@@ -181,6 +191,8 @@ struct StatusResponse {
     current_job_id: Option<i64>,
     queue_counts: QueueCounts,
     database_path: String,
+    #[cfg(feature = "self-update")]
+    app_update: crate::daemon::app_update::AppUpdateStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,8 +235,50 @@ async fn status(State(state): State<Arc<DaemonState>>) -> Response {
             canceled: counts[4],
         },
         database_path: state.queue.path().display().to_string(),
+        #[cfg(feature = "self-update")]
+        app_update: crate::daemon::app_update::snapshot(&state),
     })
     .into_response()
+}
+
+#[cfg(feature = "self-update")]
+async fn update_app_update_settings(
+    State(state): State<Arc<DaemonState>>,
+    Json(settings): Json<crate::self_update::UpdateSettings>,
+) -> Response {
+    let path = crate::self_update::UpdateSettings::path();
+    if let Err(message) = crate::self_update::UpdateSettings::save(&path, &settings) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", message);
+    }
+    let settings = match crate::self_update::UpdateSettings::load(&path) {
+        Ok(settings) => settings,
+        Err(message) => {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "internal", message);
+        }
+    };
+    crate::daemon::app_update::sync_settings(&state, &settings);
+    Json(crate::daemon::app_update::snapshot(&state)).into_response()
+}
+
+#[cfg(feature = "self-update")]
+async fn check_app_update(State(state): State<Arc<DaemonState>>) -> Response {
+    start_app_update(state, crate::daemon::app_update::ApplyMode::CheckOnly)
+}
+
+#[cfg(feature = "self-update")]
+async fn apply_app_update(State(state): State<Arc<DaemonState>>) -> Response {
+    start_app_update(state, crate::daemon::app_update::ApplyMode::Manual)
+}
+
+#[cfg(feature = "self-update")]
+fn start_app_update(
+    state: Arc<DaemonState>,
+    mode: crate::daemon::app_update::ApplyMode,
+) -> Response {
+    match crate::daemon::app_update::begin(&state, mode) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(message) => error(StatusCode::CONFLICT, "update_busy", message),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -235,11 +289,14 @@ struct CapabilitiesResponse {
 }
 
 async fn capabilities() -> Json<CapabilitiesResponse> {
+    #[allow(unused_mut)]
     let mut features = vec!["daemon", "organize"];
     #[allow(unused_mut)]
     let mut resources = Vec::new();
     #[cfg(feature = "metadata")]
     features.push("metadata");
+    #[cfg(feature = "self-update")]
+    features.push("self-update");
     #[cfg(feature = "anifilebert")]
     features.push("anifilebert");
     #[cfg(feature = "clouddrive")]
@@ -1594,6 +1651,14 @@ mod tests {
                     wake,
                     worker: Arc::new(Mutex::new(WorkerSnapshot::default())),
                     cancel_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    #[cfg(feature = "self-update")]
+                    app_update: Arc::new(Mutex::new(
+                        crate::daemon::app_update::AppUpdateStatus::starting(),
+                    )),
+                    #[cfg(feature = "self-update")]
+                    app_job_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    #[cfg(feature = "self-update")]
+                    app_update_retry_at: Arc::new(Mutex::new(None)),
                 }),
                 login_calls,
             )

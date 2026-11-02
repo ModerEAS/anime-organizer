@@ -10,6 +10,10 @@ mod commands;
 mod daemon;
 #[cfg(feature = "metadata")]
 mod mlip;
+#[cfg(any(feature = "daemon", feature = "self-update"))]
+mod paths;
+#[cfg(feature = "self-update")]
+mod self_update;
 #[cfg(feature = "metadata")]
 mod title_resolver;
 
@@ -70,6 +74,26 @@ fn main() {
 
 fn run() -> Result<(), AppError> {
     let cli = Cli::parse();
+
+    #[cfg(feature = "self-update")]
+    {
+        if cli.wait_for_parent || cli.replace_from.is_some() || cli.replace_to.is_some() {
+            let from = cli
+                .replace_from
+                .as_deref()
+                .ok_or_else(|| AppError::SelfUpdate("替换参数不完整".to_string()))?;
+            let to = cli
+                .replace_to
+                .as_deref()
+                .ok_or_else(|| AppError::SelfUpdate("替换参数不完整".to_string()))?;
+            return self_update::apply_replacement(from, to, cli.wait_for_parent, &cli.restart_arg)
+                .map_err(AppError::SelfUpdate);
+        }
+        if cli.from_self_update {
+            self_update::ignore_terminal_hangup();
+            eprintln!("程序已更新并重新启动。");
+        }
+    }
 
     #[cfg(feature = "daemon")]
     if cli.daemon {

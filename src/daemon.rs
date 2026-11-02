@@ -7,6 +7,8 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod api;
+#[cfg(feature = "self-update")]
+pub(crate) mod app_update;
 #[cfg(feature = "clouddrive")]
 pub(crate) mod cloud;
 pub(crate) mod model;
@@ -34,6 +36,12 @@ pub(crate) struct DaemonState {
     pub(crate) wake: mpsc::Sender<()>,
     pub(crate) worker: Arc<Mutex<WorkerSnapshot>>,
     pub(crate) cancel_requested: Arc<AtomicBool>,
+    #[cfg(feature = "self-update")]
+    pub(crate) app_update: Arc<Mutex<app_update::AppUpdateStatus>>,
+    #[cfg(feature = "self-update")]
+    pub(crate) app_job_running: Arc<AtomicBool>,
+    #[cfg(feature = "self-update")]
+    pub(crate) app_update_retry_at: Arc<Mutex<Option<Instant>>>,
 }
 
 pub(crate) fn run() -> Result<(), AppError> {
@@ -62,6 +70,12 @@ pub(crate) fn run() -> Result<(), AppError> {
         wake: wake_tx.clone(),
         worker: worker.clone(),
         cancel_requested: cancel_requested.clone(),
+        #[cfg(feature = "self-update")]
+        app_update: Arc::new(Mutex::new(app_update::initial_status())),
+        #[cfg(feature = "self-update")]
+        app_job_running: Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "self-update")]
+        app_update_retry_at: Arc::new(Mutex::new(None)),
     });
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| AppError::MetadataFetchError(format!("创建异步运行时失败: {error}")))?;
@@ -90,6 +104,8 @@ async fn run_http(state: Arc<DaemonState>) -> Result<(), AppError> {
         .map_err(|error| AppError::MetadataFetchError(format!("绑定 daemon 地址失败: {error}")))?;
     println!("anime-organizer daemon listening at http://127.0.0.1:32145/");
 
+    #[cfg(feature = "self-update")]
+    app_update::start(state.clone());
     #[cfg(feature = "metadata")]
     start_animeatlas_refresh_scheduler();
     #[cfg(feature = "metadata")]
@@ -232,27 +248,7 @@ fn refresh_job_for(queue: &QueueRepository, idempotency_key: &str) -> bool {
 }
 
 pub(crate) fn daemon_db_path() -> PathBuf {
-    #[cfg(windows)]
-    {
-        let root = std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("APPDATA"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        root.join("anime-organizer").join("daemon.db")
-    }
-
-    #[cfg(not(windows))]
-    {
-        let root = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|home| home.join(".local").join("share"))
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        root.join("anime-organizer").join("daemon.db")
-    }
+    crate::paths::data_dir().join("daemon.db")
 }
 
 #[cfg(all(test, feature = "metadata"))]

@@ -67,6 +67,17 @@ pub(crate) fn run_command(command: Commands) -> Result<(), AppError> {
                 .map_err(|e| AppError::MetadataFetchError(format!("创建异步运行时失败: {e}")))?;
             runtime.block_on(run_torrent_scrape(args))
         }
+        #[cfg(feature = "self-update")]
+        Commands::Update(args) => {
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|error| AppError::SelfUpdate(format!("创建异步运行时失败: {error}")))?;
+            runtime
+                .block_on(crate::self_update::run_cli(
+                    args.check,
+                    args.feed.as_deref(),
+                ))
+                .map_err(AppError::SelfUpdate)
+        }
     }
 }
 

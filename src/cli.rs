@@ -3,20 +3,34 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const APP_LONG_ABOUT: &str = concat!(
-    "AnimeOrganizer v",
-    env!("CARGO_PKG_VERSION"),
-    " - 跨平台动漫文件整理工具\n\n",
-    "默认模式用于批量整理动漫文件：\n",
-    "    aniorg --source=\"D:\\Downloads\" --target=\"E:\\Anime\"\n\n",
-    "启用元数据刮削：\n",
-    "    aniorg --source=\"D:\\Downloads\" --scrape-metadata\n\n",
-    "生成 MiruPlay MLIP 媒体库：\n",
-    "    aniorg --source=\"D:\\Downloads\" --target=\"E:\\Anime\" --mlip\n\n",
-    "启用 scraper 子命令（需以 --features scraper 编译）：\n",
-    "    aniorg scrape --days 7 --format json\n",
-    "    aniorg match --input scraped.json --format github\n"
+macro_rules! app_long_about {
+    ($($extra:literal)*) => {
+        concat!(
+            "AnimeOrganizer v",
+            env!("CARGO_PKG_VERSION"),
+            " - 跨平台动漫文件整理工具\n\n",
+            "默认模式用于批量整理动漫文件：\n",
+            "    aniorg --source=\"D:\\Downloads\" --target=\"E:\\Anime\"\n\n",
+            "启用元数据刮削：\n",
+            "    aniorg --source=\"D:\\Downloads\" --scrape-metadata\n\n",
+            "生成 MiruPlay MLIP 媒体库：\n",
+            "    aniorg --source=\"D:\\Downloads\" --target=\"E:\\Anime\" --mlip\n\n",
+            "启用 scraper 子命令（需以 --features scraper 编译）：\n",
+            "    aniorg scrape --days 7 --format json\n",
+            "    aniorg match --input scraped.json --format github\n",
+            $($extra),*
+        )
+    };
+}
+
+#[cfg(feature = "self-update")]
+const APP_LONG_ABOUT: &str = app_long_about!(
+    "\n检查并安装新版本：\n"
+    "    aniorg update\n"
+    "    aniorg update --check\n"
 );
+#[cfg(not(feature = "self-update"))]
+const APP_LONG_ABOUT: &str = app_long_about!();
 
 /// 跨平台动漫文件整理工具
 #[derive(Parser, Debug)]
@@ -29,6 +43,31 @@ pub(crate) struct Cli {
     #[cfg(feature = "daemon")]
     #[arg(long)]
     pub(crate) daemon: bool,
+
+    /// 替换进程使用：新程序文件。
+    #[cfg(feature = "self-update")]
+    #[arg(long, hide = true)]
+    pub(crate) replace_from: Option<PathBuf>,
+
+    /// 替换进程使用：当前程序路径。
+    #[cfg(feature = "self-update")]
+    #[arg(long, hide = true)]
+    pub(crate) replace_to: Option<PathBuf>,
+
+    /// 替换进程使用：等原进程退出后再替换。
+    #[cfg(feature = "self-update")]
+    #[arg(long, hide = true)]
+    pub(crate) wait_for_parent: bool,
+
+    /// 替换完成后重新启动时附带的原始参数。
+    #[cfg(feature = "self-update")]
+    #[arg(long, hide = true, allow_hyphen_values = true)]
+    pub(crate) restart_arg: Vec<String>,
+
+    /// 这次启动来自程序自己的替换。
+    #[cfg(feature = "self-update")]
+    #[arg(long, hide = true)]
+    pub(crate) from_self_update: bool,
 
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
@@ -205,12 +244,27 @@ pub(crate) struct CompactArtworkPacksArgs {
     pub(crate) apply_plan: Option<PathBuf>,
 }
 
+#[cfg(feature = "self-update")]
+#[derive(Args, Debug, Clone)]
+pub(crate) struct UpdateArgs {
+    /// 只查询，不下载、不替换
+    #[arg(long)]
+    pub(crate) check: bool,
+
+    /// 覆盖更新源。默认使用 GitHub 最新 Release；只允许 https，或本机 http
+    #[arg(long, value_name = "URL")]
+    pub(crate) feed: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
     /// 生成或执行媒体库布局统一计划
     NormalizeLayout(NormalizeLayoutArgs),
     /// 验证或压实 MLIP artwork packs
     CompactArtworkPacks(CompactArtworkPacksArgs),
+    /// 检查 GitHub Release 并替换当前程序
+    #[cfg(feature = "self-update")]
+    Update(UpdateArgs),
     #[cfg(feature = "scraper")]
     Scrape(ScrapeArgs),
     #[cfg(feature = "scraper")]
@@ -505,4 +559,37 @@ fn default_rss_interval() -> u64 {
 #[cfg(feature = "torrent-scraper")]
 fn default_torrent_pages() -> u32 {
     1
+}
+
+#[cfg(all(test, feature = "self-update"))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn replacement_args_keep_daemon_flag() {
+        let cli = Cli::try_parse_from([
+            "aniorg",
+            "--replace-from",
+            "aniorg.new",
+            "--replace-to",
+            "aniorg",
+            "--wait-for-parent",
+            "--restart-arg",
+            "--daemon",
+        ])
+        .expect("parse replacement args");
+        assert!(cli.wait_for_parent);
+        assert_eq!(cli.restart_arg, vec!["--daemon".to_string()]);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn update_check_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["aniorg", "update", "--check"]).expect("parse update");
+        match cli.command {
+            Some(Commands::Update(args)) => assert!(args.check),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }
