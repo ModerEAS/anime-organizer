@@ -317,6 +317,10 @@ pub fn extract_asset_archive(
             format!("archive is {length} bytes, above the {MAX_ARCHIVE_FILE_BYTES} byte cap"),
         ));
     }
+    if !destination.exists() {
+        fs::create_dir_all(destination)?;
+    }
+    ensure_real_directory(destination)?;
     let extension = extension_of(archive).unwrap_or_default();
     let outcome = match extension.as_str() {
         "zip" => extract_zip(archive, destination, limits),
@@ -325,8 +329,7 @@ pub fn extract_asset_archive(
         _ => Err(rejected_error(archive, "unsupported archive extension")),
     };
     if outcome.is_err() {
-        let _ = fs::remove_dir_all(destination);
-        let _ = fs::create_dir_all(destination);
+        clear_extraction_directory(destination);
     }
     outcome
 }
@@ -461,7 +464,7 @@ fn extract_zip(
             AssetDisposition::Asset(kind) => {
                 let output = join_relative(destination, &relative_string(&relative));
                 let declared = entry.size();
-                copy_entry(archive, &mut entry, &output, declared)?;
+                copy_entry(archive, destination, &mut entry, &output, declared)?;
                 outcome.assets.push(ExtractedAsset {
                     relative_path: relative_string(&relative),
                     absolute_path: output,
@@ -539,7 +542,9 @@ fn extract_sevenz(
             match asset_kind(&relative) {
                 AssetDisposition::Asset(kind) => {
                     let output = join_relative(destination, &relative_string(&relative));
-                    if let Err(error) = copy_entry(archive, reader, &output, entry.size()) {
+                    if let Err(error) =
+                        copy_entry(archive, destination, reader, &output, entry.size())
+                    {
                         write_error = Some(error);
                         return Ok(false);
                     }
@@ -613,7 +618,7 @@ fn extract_rar(
                     ));
                 }
                 let output = join_relative(destination, &relative_string(&relative));
-                write_bytes(archive, &output, &bytes)?;
+                write_bytes(destination, &output, &bytes)?;
                 outcome.assets.push(ExtractedAsset {
                     relative_path: relative_string(&relative),
                     absolute_path: output,
@@ -773,9 +778,15 @@ fn relative_string(path: &Path) -> String {
         .join("/")
 }
 
-fn copy_entry(archive: &Path, reader: &mut dyn Read, output: &Path, declared: u64) -> Result<()> {
+fn copy_entry(
+    archive: &Path,
+    destination: &Path,
+    reader: &mut dyn Read,
+    output: &Path,
+    declared: u64,
+) -> Result<()> {
     if let Some(parent) = output.parent() {
-        create_directories_without_following(parent)?;
+        create_directories_without_following(destination, parent)?;
     }
     let mut file = OpenOptions::new()
         .write(true)
@@ -787,24 +798,22 @@ fn copy_entry(archive: &Path, reader: &mut dyn Read, output: &Path, declared: u6
         let _ = fs::remove_file(output);
         return Err(rejected_error(archive, "entry grew past its declared size"));
     }
-    ensure_regular_file_within(output.parent().unwrap_or(Path::new(".")), output)?;
+    ensure_regular_file_within(destination, output)?;
     Ok(())
 }
 
-fn write_bytes(_archive: &Path, output: &Path, bytes: &[u8]) -> Result<()> {
+fn write_bytes(destination: &Path, output: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = output.parent() {
-        create_directories_without_following(parent)?;
+        create_directories_without_following(destination, parent)?;
     }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)?;
     file.write_all(bytes)?;
-    ensure_regular_file_within(output.parent().unwrap_or(Path::new(".")), output).inspect_err(
-        |_| {
-            let _ = fs::remove_file(output);
-        },
-    )?;
+    ensure_regular_file_within(destination, output).inspect_err(|_| {
+        let _ = fs::remove_file(output);
+    })?;
     Ok(())
 }
 
@@ -836,23 +845,54 @@ fn drain_into(reader: &mut dyn Read, writer: &mut dyn Write, declared: u64) -> R
     Ok(written)
 }
 
-fn create_directories_without_following(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(AppError::FileOperation {
+            path: path.to_path_buf(),
+            message: "refusing to extract through a symlink".to_string(),
+        }),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(AppError::FileOperation {
+            path: path.to_path_buf(),
+            message: "extraction destination is not a directory".to_string(),
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn clear_extraction_directory(destination: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(destination) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    let _ = fs::remove_dir_all(destination);
+    let _ = fs::create_dir_all(destination);
+}
+
+/// 只检查并创建目标目录内部的路径。
+///
+/// macOS 的 `/var` 和 `/tmp` 是指向 `/private` 的符号链接。调用方给出的临时目录
+/// 可以经过这些系统链接，但压缩包条目不能在目标目录内部再穿越符号链接。
+fn create_directories_without_following(root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::FileOperation {
+            path: path.to_path_buf(),
+            message: "refusing to create a directory outside the extraction root".to_string(),
+        })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
         match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(AppError::FileOperation {
                     path: path.to_path_buf(),
                     message: "refusing to create a directory via '..'".to_string(),
                 });
             }
-            Component::Normal(part) => current.push(part),
-        }
-        if current.as_os_str().is_empty() {
-            continue;
         }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1249,6 +1289,41 @@ mod tests {
             "[ANi] Test Show - Fonts.7z",
             "[ANi] Test Show - 06 [WebRip].mkv"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_allows_symlink_ancestors_outside_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let destination = linked.join("out");
+        fs::create_dir(&destination).unwrap();
+        let archive = dir.path().join("subs.zip");
+        write_zip(&archive, &[("fonts/Show.ttf", b"font", None)]);
+
+        let outcome = extract_asset_archive(&archive, &destination, &limits()).unwrap();
+        assert_eq!(outcome.assets.len(), 1);
+        assert_eq!(
+            fs::read(real.join("out").join("fonts").join("Show.ttf")).unwrap(),
+            b"font"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_refuses_symlink_directory_inside_the_destination() {
+        let destination = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), destination.path().join("fonts")).unwrap();
+        let archive = destination.path().join("fonts.zip");
+        write_zip(&archive, &[("fonts/Show.ttf", b"font", None)]);
+
+        let error = extract_asset_archive(&archive, destination.path(), &limits()).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+        assert!(outside.path().read_dir().unwrap().next().is_none());
     }
 
     #[test]
