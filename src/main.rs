@@ -25,6 +25,10 @@ use crate::mlip::{
     download_images, fetch_anime_metadata, fetch_bangumi_episodes_cached, min_episode_by_series,
     MetadataLookup,
 };
+use anime_organizer::archive_assets::{
+    join_relative, prepare_source_archives, subtitle_target_name, ArchiveLimits, IngestOptions,
+    PreparedArchive,
+};
 #[cfg(feature = "metadata")]
 use anime_organizer::library_index::{Artwork, ArtworkKind, ExternalProvider};
 use anime_organizer::{
@@ -121,6 +125,8 @@ fn reject_daemon_conflicts(cli: &Cli) -> Result<(), AppError> {
         || args.target.is_some()
         || args.fallback_on_link_failure.is_some()
         || args.dry_run
+        || args.delete_extracted_archives
+        || args.scan_extracted_archives
         || args.include_ext.is_some()
         || args.verbose
         || args.scrape_metadata
@@ -228,6 +234,7 @@ fn run_organize(
         .map(FallbackMode::to_operation_mode);
     let extensions = build_extensions(&args.include_ext);
     let subtitle_candidates = FileOrganizer::collect_external_subtitle_candidates(&source);
+    let archives = load_source_archives(&source, args.scan_extracted_archives, log)?;
     log(&format!("Scanning {}", source.display()));
     let probe_runtime = runtime_probe_enabled(&args);
 
@@ -285,13 +292,35 @@ fn run_organize(
             log,
         ) {
             Ok((target_path, sha256_full)) => {
-                succeeded += 1;
-                if args.writes_library_index() {
-                    let mut record =
-                        LibraryIndexRecord::from_anime_file(&target, &target_path, &anime_file)?;
-                    record.sha256_full = sha256_full;
-                    apply_runtime_probe(&mut record, &target, probe_runtime, args.verbose);
-                    library_records.push(record);
+                match place_archive_assets(
+                    Path::new(&anime_file.original_path),
+                    &target_path,
+                    &archives,
+                    args.mode,
+                    args.dry_run,
+                ) {
+                    Ok(placed_subtitles) => {
+                        succeeded += 1;
+                        if args.writes_library_index() {
+                            let mut record = LibraryIndexRecord::from_anime_file(
+                                &target,
+                                &target_path,
+                                &anime_file,
+                            )?;
+                            record.sha256_full = sha256_full;
+                            remember_placed_subtitles(&mut record, &target, &placed_subtitles);
+                            apply_runtime_probe(&mut record, &target, probe_runtime, args.verbose);
+                            library_records.push(record);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("放入提取资产失败 {}: {error}", anime_file.original_path);
+                        log(&format!(
+                            "Failed to place extracted assets for {}: {error}",
+                            anime_file.original_path
+                        ));
+                        failed += 1;
+                    }
                 }
             }
             Err(_) => failed += 1,
@@ -304,6 +333,9 @@ fn run_organize(
     ));
     canceled |= cancel();
     finish_library_index(&args, &target, &extensions, &library_records)?;
+    if args.delete_extracted_archives && !args.dry_run {
+        delete_consumed_archives(&archives, &source, log)?;
+    }
     if canceled {
         return Err(AppError::Canceled);
     }
@@ -453,6 +485,7 @@ async fn run_with_metadata(
 
     let source = source.expect("non-refresh organize requires source");
     let subtitle_candidates = FileOrganizer::collect_external_subtitle_candidates(&source);
+    let archives = load_source_archives(&source, args.scan_extracted_archives, log)?;
     let anime_groups =
         collect_anime_groups(&source, &extensions, args.filename_parser, args.verbose)?;
     log(&format!("Discovered {} anime groups", anime_groups.len()));
@@ -584,12 +617,31 @@ async fn run_with_metadata(
                 log,
             ) {
                 Ok((target_path, sha256_full)) => {
+                    let placed_subtitles = match place_archive_assets(
+                        Path::new(&file.original_path),
+                        &target_path,
+                        &archives,
+                        args.mode,
+                        args.dry_run,
+                    ) {
+                        Ok(placed_subtitles) => placed_subtitles,
+                        Err(error) => {
+                            eprintln!("放入提取资产失败 {}: {error}", file.original_path);
+                            log(&format!(
+                                "Failed to place extracted assets for {}: {error}",
+                                file.original_path
+                            ));
+                            failed += 1;
+                            continue;
+                        }
+                    };
                     succeeded += 1;
 
                     if args.writes_library_index() {
                         let mut record =
                             LibraryIndexRecord::from_anime_file(&target, &target_path, &file)?;
                         record.sha256_full = sha256_full;
+                        remember_placed_subtitles(&mut record, &target, &placed_subtitles);
                         if let Some(ref meta) = metadata {
                             record.apply_metadata(meta);
                             apply_bangumi_episode_details(
@@ -666,6 +718,9 @@ async fn run_with_metadata(
         },
     )
     .await?;
+    if args.delete_extracted_archives && !args.dry_run {
+        delete_consumed_archives(&archives, &source, log)?;
+    }
 
     if canceled {
         return Err(AppError::Canceled);
@@ -824,6 +879,134 @@ fn cleanup_moved_source_directories(
                 "Failed to clean empty source directory {}: {error}",
                 directory.display()
             )),
+        }
+    }
+    Ok(())
+}
+
+fn archive_search_root(source: &Path) -> &Path {
+    if source.is_dir() {
+        source
+    } else {
+        source.parent().unwrap_or(source)
+    }
+}
+
+fn load_source_archives(
+    source: &Path,
+    scan_with_defender: bool,
+    log: &dyn Fn(&str),
+) -> Result<Vec<PreparedArchive>, AppError> {
+    let archives = prepare_source_archives(
+        archive_search_root(source),
+        is_supplemental_video_path,
+        &IngestOptions {
+            limits: ArchiveLimits::default(),
+            scan_with_defender,
+        },
+    )?;
+    for archive in &archives {
+        for warning in &archive.warnings {
+            eprintln!("压缩包 {}：{warning}", archive.source.display());
+            log(&format!("Archive {}: {warning}", archive.source.display()));
+        }
+    }
+    Ok(archives)
+}
+
+fn place_archive_assets(
+    video_path: &Path,
+    target_video: &Path,
+    archives: &[PreparedArchive],
+    mode: OperationMode,
+    dry_run: bool,
+) -> Result<Vec<PathBuf>, AppError> {
+    let Some(video_name) = video_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let Some(video_dir) = video_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(target_dir) = target_video.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut placed_subtitles = Vec::new();
+    for archive in archives.iter().filter(|archive| !archive.rejected) {
+        if archive.directory != video_dir {
+            continue;
+        }
+        let mut placed = false;
+        for subtitle in archive.subtitles_for(video_name) {
+            let target = target_dir.join(subtitle_target_name(video_name, subtitle.file_name()));
+            FileOrganizer::place_extracted_asset(&subtitle.absolute_path, &target, mode, dry_run)?;
+            placed_subtitles.push(target);
+            placed = true;
+        }
+        for font in archive.fonts_for(video_name) {
+            let target = join_relative(target_dir, &font.relative_path);
+            FileOrganizer::place_extracted_asset(&font.absolute_path, &target, mode, dry_run)?;
+            placed = true;
+        }
+        if placed && !dry_run {
+            archive.mark_consumed();
+        }
+    }
+    Ok(placed_subtitles)
+}
+
+fn remember_placed_subtitles(
+    record: &mut LibraryIndexRecord,
+    target: &Path,
+    subtitles: &[PathBuf],
+) {
+    for subtitle in subtitles {
+        let Ok(relative) = subtitle.strip_prefix(target) else {
+            continue;
+        };
+        let relative = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => value.to_str().map(str::to_string),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if !relative.is_empty() && !record.subtitle_paths.iter().any(|path| path == &relative) {
+            record.subtitle_paths.push(relative);
+        }
+    }
+}
+
+fn delete_consumed_archives(
+    archives: &[PreparedArchive],
+    source: &Path,
+    log: &dyn Fn(&str),
+) -> Result<(), AppError> {
+    let root = archive_search_root(source);
+    for archive in archives {
+        if archive.rejected || !archive.consumed() {
+            continue;
+        }
+        std::fs::remove_file(&archive.source)?;
+        eprintln!("已删除已提取的压缩包 {}", archive.source.display());
+        log(&format!(
+            "Deleted extracted archive {}",
+            archive.source.display()
+        ));
+        if let Some(parent) = archive.source.parent() {
+            match FileOrganizer::cleanup_empty_ancestors(parent, root) {
+                Ok(removed) => {
+                    for path in removed {
+                        log(&format!(
+                            "Removed empty source directory {}",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(error) => log(&format!(
+                    "Failed to clean empty source directory after archive deletion: {error}"
+                )),
+            }
         }
     }
     Ok(())
@@ -2093,5 +2276,123 @@ mod tests {
 
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 1);
         assert!(target.path().join("Test Anime").exists());
+    }
+
+    fn write_asset_zip(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        for (name, bytes) in files {
+            zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn organize_extracts_subtitle_archive_beside_the_episode() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let video = "[SweetSub] Test Show - 01 [1080P].mkv";
+        std::fs::write(source.path().join(video), b"video").unwrap();
+        write_asset_zip(
+            &source.path().join("[SweetSub] Test Show - Subtitles.zip"),
+            &[
+                ("[SweetSub] Test Show - 01.chs.ass", b"dialogue"),
+                ("fonts/Show.ttf", b"font-bytes"),
+                ("readme.txt", b"skip"),
+            ],
+        );
+
+        run_organize_entry(OrganizeArgs {
+            source: Some(source.path().to_path_buf()),
+            target: Some(target.path().to_path_buf()),
+            mode: OperationMode::Copy,
+            ..OrganizeArgs::default()
+        })
+        .unwrap();
+
+        let episode = target.path().join("Test Show");
+        assert_eq!(
+            std::fs::read(episode.join("[SweetSub] Test Show - 01.chs.ass")).unwrap(),
+            b"dialogue"
+        );
+        assert_eq!(
+            std::fs::read(episode.join("fonts").join("Show.ttf")).unwrap(),
+            b"font-bytes"
+        );
+        assert!(!episode.join("readme.txt").exists());
+        assert!(source
+            .path()
+            .join("[SweetSub] Test Show - Subtitles.zip")
+            .exists());
+        assert!(source.path().join(video).exists());
+    }
+
+    #[test]
+    fn organize_deletes_consumed_archive_when_requested() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("[SweetSub] Test Show - 01 [1080P].mkv"),
+            b"video",
+        )
+        .unwrap();
+        let archive = source.path().join("[SweetSub] Test Show - Subtitles.zip");
+        write_asset_zip(
+            &archive,
+            &[("[SweetSub] Test Show - 01.chs.ass", b"dialogue")],
+        );
+
+        run_organize_entry(OrganizeArgs {
+            source: Some(source.path().to_path_buf()),
+            target: Some(target.path().to_path_buf()),
+            mode: OperationMode::Copy,
+            delete_extracted_archives: true,
+            ..OrganizeArgs::default()
+        })
+        .unwrap();
+
+        assert!(!archive.exists());
+        assert!(target
+            .path()
+            .join("Test Show")
+            .join("[SweetSub] Test Show - 01.chs.ass")
+            .exists());
+        assert!(source
+            .path()
+            .join("[SweetSub] Test Show - 01 [1080P].mkv")
+            .exists());
+    }
+
+    #[test]
+    fn organize_rejects_zip_slip_and_keeps_the_video() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("[ANi] Test Show - 01.mkv"), b"video").unwrap();
+        write_asset_zip(
+            &source.path().join("Subtitles.zip"),
+            &[("../../evil.exe", b"MZ"), ("payload.exe", b"MZ")],
+        );
+
+        run_organize_entry(OrganizeArgs {
+            source: Some(source.path().to_path_buf()),
+            target: Some(target.path().to_path_buf()),
+            mode: OperationMode::Copy,
+            ..OrganizeArgs::default()
+        })
+        .unwrap();
+
+        assert!(target
+            .path()
+            .join("Test Show")
+            .join("[ANi] Test Show - 01.mkv")
+            .exists());
+        assert!(!source.path().join("evil.exe").exists());
+        assert!(!target.path().join("evil.exe").exists());
+        assert!(!target.path().join("Test Show").join("payload.exe").exists());
+        assert!(source.path().join("Subtitles.zip").exists());
     }
 }

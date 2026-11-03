@@ -664,6 +664,8 @@ mod tests {
             mode: OperationMode::Copy,
             fallback_on_link_failure: None,
             dry_run: false,
+            delete_extracted_archives: false,
+            scan_extracted_archives: false,
             include_ext: None,
             verbose: true,
             scrape_metadata: false,

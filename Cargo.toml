@@ -30,8 +30,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 flate2 = { version = "1.1", optional = true }
 ndarray = { version = "0.17", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "copy-dylibs", "tls-native", "api-24"], optional = true }
-zip = { version = "2", optional = true }
-tempfile = { version = "3.9", optional = true }
+zip = { version = "2" }
+tempfile = { version = "3.9" }
 urlencoding = { version = "2", optional = true }
 tracing = "0.1"
 tonic = { version = "0.12", features = ["tls", "tls-roots"], optional = true }
@@ -51,6 +51,8 @@ url = { version = "2", optional = true }
 time = { version = "0.3", features = ["formatting"] }
 uuid = { version = "1", features = ["v5"] }
 zhhz = { version = "0.7.7", optional = true }
+sevenz-rust2 = { version = "0.10.0", features = ["deflate"] }
+rar-codec = "0.1.2"
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -62,15 +64,15 @@ tokio = { version = "1", features = ["full"] }
 [features]
 default = ["metadata", "daemon", "self-update"]
 daemon = ["dep:axum", "dep:tokio", "dep:url"]
-self-update = ["dep:reqwest", "dep:tokio", "dep:sha2", "dep:flate2", "dep:zip", "dep:tar", "dep:tokio-util", "dep:libc"]
+self-update = ["dep:reqwest", "dep:tokio", "dep:sha2", "dep:flate2", "dep:tar", "dep:tokio-util", "dep:libc"]
 anifilebert = ["dep:flate2", "dep:ndarray", "dep:ort"]
 anifilebert-directml = ["anifilebert", "ort/directml"]
 anifilebert-amd-npu = ["anifilebert-directml"]
-metadata = ["dep:reqwest", "dep:tokio", "dep:zip", "dep:zhhz"]
-scraper = ["metadata", "dep:zip", "dep:tempfile"]
+metadata = ["dep:reqwest", "dep:tokio", "dep:zhhz"]
+scraper = ["metadata"]
 torrent-scraper = ["dep:tokio", "dep:reqwest", "dep:urlencoding"]
 llm-api = []
-clouddrive = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:sha1", "dep:sha2", "dep:bt_bencode", "dep:tower", "dep:tracing-subscriber", "dep:url", "dep:urlencoding", "dep:reqwest", "dep:tokio", "dep:tokio-stream", "dep:tokio-util", "dep:async-trait", "dep:tempfile"]
+clouddrive = ["dep:tonic", "dep:prost", "dep:prost-types", "dep:sha1", "dep:sha2", "dep:bt_bencode", "dep:tower", "dep:tracing-subscriber", "dep:url", "dep:urlencoding", "dep:reqwest", "dep:tokio", "dep:tokio-stream", "dep:tokio-util", "dep:async-trait"]
 scraper-clouddrive = ["scraper", "clouddrive"]
 
 [profile.release]

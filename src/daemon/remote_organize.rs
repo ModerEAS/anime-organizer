@@ -1,3 +1,7 @@
+use anime_organizer::archive_assets::{
+    extract_asset_archive, font_applies, is_asset_archive_name, subtitle_matches,
+    subtitle_target_name, ArchiveLimits, AssetKind, MAX_ARCHIVE_FILE_BYTES,
+};
 use anime_organizer::rss::client::{proto, CloudDriveClientTrait};
 use anime_organizer::rss::db::{DownloadTask, RssDatabase, Subscription};
 use anime_organizer::rss::proxy::{build_http_client, ProxyConfig};
@@ -335,16 +339,25 @@ pub(crate) async fn organize_subscription_between_with_progress(
             .filter(|file| is_external_subtitle(&file.path))
             .map(|file| PathBuf::from(&file.path))
             .collect::<Vec<_>>();
+        let archive_candidates = tree
+            .files
+            .iter()
+            .filter(|file| is_asset_archive_name(&file.path))
+            .count();
         progress(
             "info",
             Some(root_index + 1),
             Some(finished_root_count),
             &format!(
-                "Scanned root '{}': {} file(s), {} media candidate(s), {} subtitle candidate(s)",
+                "Scanned root '{}': {} file(s), {} media candidate(s), {} subtitle candidate(s), {} archive candidate(s)",
                 root,
                 tree.files.len(),
-                tree.files.len().saturating_sub(subtitle_candidates.len()),
-                subtitle_candidates.len()
+                tree.files
+                    .len()
+                    .saturating_sub(subtitle_candidates.len())
+                    .saturating_sub(archive_candidates),
+                subtitle_candidates.len(),
+                archive_candidates
             ),
         );
         let sizes_by_path = tree
@@ -361,7 +374,7 @@ pub(crate) async fn organize_subscription_between_with_progress(
         for media in tree
             .files
             .iter()
-            .filter(|file| !is_external_subtitle(&file.path))
+            .filter(|file| !is_external_subtitle(&file.path) && !is_asset_archive_name(&file.path))
         {
             let Some(anime) = FilenameParser::parse(Path::new(&media.path)) else {
                 progress(
@@ -627,6 +640,7 @@ pub(crate) async fn organize_subscription_between_with_progress(
                 series_title,
                 season,
                 episode,
+                uploads: Vec::new(),
             });
         }
         if conflicted || planned.is_empty() {
@@ -661,6 +675,43 @@ pub(crate) async fn organize_subscription_between_with_progress(
         }
         planned_destination_names.extend(root_destination_names);
 
+        let mut staged = match stage_root_archives(
+            source_client,
+            &tree.files,
+            &planned,
+            move_sources && subscription.remove_empty_dirs,
+            progress,
+            root_index,
+            finished_root_count,
+        )
+        .await
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                progress(
+                    "warning",
+                    Some(root_index + 1),
+                    Some(finished_root_count),
+                    &format!(
+                        "Skipped root '{offline_name}': failed to download an asset archive: {error}"
+                    ),
+                );
+                continue;
+            }
+        };
+        for group in &mut planned {
+            let Some(media) = group
+                .files
+                .iter()
+                .find(|file| !is_external_subtitle(&file.path))
+            else {
+                continue;
+            };
+            if let Some(uploads) = staged.uploads_by_media.remove(&media.path) {
+                group.uploads = uploads;
+            }
+        }
+
         // Create each distinct target directory once. A final fresh listing is
         // performed after MLIP publication immediately before each API action.
         for group in planned
@@ -688,6 +739,8 @@ pub(crate) async fn organize_subscription_between_with_progress(
             task_id,
             info_hash,
             groups: planned,
+            temps: staged.temps,
+            archives_to_delete: staged.archives_to_delete,
         });
     }
 
@@ -813,12 +866,13 @@ pub(crate) async fn organize_subscription_between_with_progress(
                 )
                 .await?;
             }
+            let uploaded = upload_group_assets(target_client, group, overwrite, progress).await?;
             if copying {
                 summary.copied_media += 1;
-                summary.copied_files += group.files.len();
+                summary.copied_files += group.files.len() + uploaded;
             } else {
                 summary.moved_media += 1;
-                summary.moved_files += group.files.len();
+                summary.moved_files += group.files.len() + uploaded;
             }
             progress(
                 "info",
@@ -877,8 +931,9 @@ pub(crate) async fn organize_subscription_between_with_progress(
                     ),
                 );
             }
+            let uploaded = upload_group_assets(target_client, group, overwrite, progress).await?;
             summary.moved_media += 1;
-            summary.moved_files += group.files.len();
+            summary.moved_files += group.files.len() + uploaded;
         }
 
         for group in planned_root
@@ -897,6 +952,8 @@ pub(crate) async fn organize_subscription_between_with_progress(
                     group.destination
                 ),
             );
+            let uploaded = upload_group_assets(target_client, group, overwrite, progress).await?;
+            summary.copied_files += uploaded;
         }
 
         if !subscription.remote_mlip {
@@ -981,6 +1038,19 @@ async fn finalize_planned_root(
         }
     }
 
+    for archive in &planned_root.archives_to_delete {
+        source_client
+            .delete_file(archive)
+            .await
+            .map_err(|error| error.to_string())?;
+        progress(
+            "info",
+            None,
+            None,
+            &format!("Removed extracted asset archive '{archive}'"),
+        );
+    }
+
     let mut removed_empty_directory = 0;
     if subscription.remove_empty_dirs
         && planned_root.root_is_directory
@@ -1048,6 +1118,17 @@ struct PlannedRoot {
     task_id: Option<i64>,
     info_hash: Option<String>,
     groups: Vec<PlannedGroup>,
+    /// 解压出的字幕和字体在上传完成前都指向这些临时目录。
+    #[allow(dead_code)]
+    temps: Vec<tempfile::TempDir>,
+    archives_to_delete: Vec<String>,
+}
+
+#[derive(Clone)]
+struct PlannedUpload {
+    relative_name: String,
+    local_path: PathBuf,
+    is_subtitle: bool,
 }
 
 #[derive(Clone)]
@@ -1059,6 +1140,13 @@ struct PlannedGroup {
     series_title: String,
     season: i64,
     episode: f64,
+    uploads: Vec<PlannedUpload>,
+}
+
+struct StagedArchiveAssets {
+    temps: Vec<tempfile::TempDir>,
+    uploads_by_media: HashMap<String, Vec<PlannedUpload>>,
+    archives_to_delete: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1653,7 +1741,7 @@ async fn build_remote_index_records(
         if sha256_full.len() != 64 || !sha256_full.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("CloudDrive returned an invalid media SHA-256".to_string());
         }
-        let subtitle_paths = group
+        let mut subtitle_paths = group
             .files
             .iter()
             .zip(&group.names)
@@ -1662,6 +1750,13 @@ async fn build_remote_index_records(
                 remote_relative_path(target_root, &join_remote_path(&group.destination, name))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        for upload in group.uploads.iter().filter(|upload| upload.is_subtitle) {
+            let full = join_relative_remote(&group.destination, &upload.relative_name)?;
+            let relative = remote_relative_path(target_root, &full)?;
+            if !subtitle_paths.contains(&relative) {
+                subtitle_paths.push(relative);
+            }
+        }
         progress(
             "info",
             Some(group_index + 1),
@@ -2222,6 +2317,267 @@ fn remote_parent(path: &str) -> Option<&str> {
 
 fn remote_file_name(path: &str) -> Option<&str> {
     path.rsplit('/').find(|component| !component.is_empty())
+}
+
+fn join_relative_remote(root: &str, relative: &str) -> Result<String, String> {
+    let mut path = root.to_string();
+    let mut appended = false;
+    for part in relative.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if !safe_component(part) {
+            return Err(format!("unsafe extracted asset name '{relative}'"));
+        }
+        path = join_remote_path(&path, part);
+        appended = true;
+    }
+    if !appended {
+        return Err(format!("empty extracted asset name '{relative}'"));
+    }
+    Ok(path)
+}
+
+async fn stage_root_archives(
+    source_client: &dyn CloudDriveClientTrait,
+    files: &[RemoteEntry],
+    planned: &[PlannedGroup],
+    delete_archives: bool,
+    progress: &ProgressReporter<'_>,
+    root_index: usize,
+    finished_root_count: usize,
+) -> Result<StagedArchiveAssets, String> {
+    let mut staged = StagedArchiveAssets {
+        temps: Vec::new(),
+        uploads_by_media: HashMap::new(),
+        archives_to_delete: Vec::new(),
+    };
+    for archive in files
+        .iter()
+        .filter(|file| is_asset_archive_name(&file.path))
+    {
+        if archive.size > i64::try_from(MAX_ARCHIVE_FILE_BYTES).unwrap_or(i64::MAX) {
+            progress(
+                "warning",
+                Some(root_index + 1),
+                Some(finished_root_count),
+                &format!(
+                    "Skipped asset archive '{}': {} bytes exceeds the {} byte download cap",
+                    archive.path, archive.size, MAX_ARCHIVE_FILE_BYTES
+                ),
+            );
+            continue;
+        }
+        let download = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+        source_client
+            .download_file(&archive.path, download.path())
+            .await
+            .map_err(|error| {
+                format!("download asset archive '{}' failed: {error}", archive.path)
+            })?;
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let archive_name = remote_file_name(&archive.path).unwrap_or("archive.bin");
+        let extension = Path::new(archive_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("bin");
+        let named_archive = temp.path().join(format!("source.{extension}"));
+        std::fs::copy(download.path(), &named_archive)
+            .map_err(|error| format!("stage asset archive '{}' failed: {error}", archive.path))?;
+        let output = temp.path().join("assets");
+        std::fs::create_dir(&output)
+            .map_err(|error| format!("stage asset archive '{}' failed: {error}", archive.path))?;
+        let outcome =
+            match extract_asset_archive(&named_archive, &output, &ArchiveLimits::default()) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    progress(
+                        "warning",
+                        Some(root_index + 1),
+                        Some(finished_root_count),
+                        &format!("Rejected asset archive '{}': {error}", archive.path),
+                    );
+                    continue;
+                }
+            };
+        for warning in &outcome.warnings {
+            progress(
+                "warning",
+                Some(root_index + 1),
+                Some(finished_root_count),
+                &format!("Asset archive '{}': {warning}", archive.path),
+            );
+        }
+        let Some(archive_parent) = remote_parent(&archive.path) else {
+            continue;
+        };
+        let mut consumed = false;
+        for group in planned {
+            let Some(media) = group
+                .files
+                .iter()
+                .find(|file| !is_external_subtitle(&file.path))
+            else {
+                continue;
+            };
+            if remote_parent(&media.path) != Some(archive_parent) {
+                continue;
+            }
+            let Some(media_name) = remote_file_name(&media.path) else {
+                continue;
+            };
+            let uploads = staged
+                .uploads_by_media
+                .entry(media.path.clone())
+                .or_default();
+            for asset in outcome.assets.iter().filter(|asset| {
+                asset.kind == AssetKind::Subtitle && subtitle_matches(media_name, asset.file_name())
+            }) {
+                if queue_upload(
+                    uploads,
+                    &group.names,
+                    subtitle_target_name(media_name, asset.file_name()),
+                    asset.absolute_path.clone(),
+                    true,
+                ) {
+                    consumed = true;
+                } else {
+                    progress(
+                        "warning",
+                        Some(root_index + 1),
+                        Some(finished_root_count),
+                        &format!(
+                            "Skipped extracted subtitle '{}' for '{}': name collides with a media file or another asset",
+                            asset.file_name(),
+                            media.path
+                        ),
+                    );
+                }
+            }
+            if font_applies(archive_name, media_name) {
+                for asset in outcome
+                    .assets
+                    .iter()
+                    .filter(|asset| asset.kind == AssetKind::Font)
+                {
+                    if queue_upload(
+                        uploads,
+                        &group.names,
+                        asset.relative_path.clone(),
+                        asset.absolute_path.clone(),
+                        false,
+                    ) {
+                        consumed = true;
+                    } else {
+                        progress(
+                            "warning",
+                            Some(root_index + 1),
+                            Some(finished_root_count),
+                            &format!(
+                                "Skipped extracted font '{}' for '{}': name collides with a media file or another asset",
+                                asset.relative_path, media.path
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        if consumed {
+            if delete_archives {
+                staged.archives_to_delete.push(archive.path.clone());
+            }
+            staged.temps.push(temp);
+        }
+    }
+    Ok(staged)
+}
+
+fn queue_upload(
+    uploads: &mut Vec<PlannedUpload>,
+    protected_names: &[String],
+    relative_name: String,
+    local_path: PathBuf,
+    is_subtitle: bool,
+) -> bool {
+    if relative_name.is_empty()
+        || (!relative_name.contains('/')
+            && protected_names.iter().any(|name| name == &relative_name))
+        || uploads
+            .iter()
+            .any(|upload| upload.relative_name == relative_name)
+    {
+        return false;
+    }
+    if relative_name
+        .split(['/', '\\'])
+        .any(|part| part.is_empty() || part == "." || part == ".." || !safe_component(part))
+    {
+        return false;
+    }
+    uploads.push(PlannedUpload {
+        relative_name,
+        local_path,
+        is_subtitle,
+    });
+    true
+}
+
+async fn upload_group_assets(
+    target_client: &dyn CloudDriveClientTrait,
+    group: &PlannedGroup,
+    overwrite: bool,
+    progress: &ProgressReporter<'_>,
+) -> Result<usize, String> {
+    let mut uploaded = 0usize;
+    for asset in &group.uploads {
+        let full = join_relative_remote(&group.destination, &asset.relative_name)?;
+        let parent =
+            remote_parent(&full).ok_or_else(|| format!("extracted asset has no parent: {full}"))?;
+        let name = remote_file_name(&full)
+            .ok_or_else(|| format!("extracted asset has no file name: {full}"))?;
+        if parent == group.destination && group.names.iter().any(|existing| existing == name) {
+            progress(
+                "warning",
+                None,
+                None,
+                &format!("Refusing to replace media file '{full}' with an extracted asset"),
+            );
+            continue;
+        }
+        if parent != group.destination {
+            ensure_directory(target_client, parent).await?;
+        }
+        let existing = inspect_destination(target_client, parent).await?;
+        if existing.contains_key(name) {
+            if !overwrite {
+                progress(
+                    "warning",
+                    None,
+                    None,
+                    &format!(
+                        "Skipped extracted asset '{full}' because the destination name exists"
+                    ),
+                );
+                continue;
+            }
+            target_client
+                .delete_file(&full)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        target_client
+            .upload_file(parent, name, &asset.local_path)
+            .await
+            .map_err(|error| format!("upload extracted asset '{full}' failed: {error}"))?;
+        uploaded += 1;
+        progress(
+            "info",
+            None,
+            None,
+            &format!("Uploaded extracted asset '{full}'"),
+        );
+    }
+    Ok(uploaded)
 }
 
 #[cfg(test)]
@@ -2794,6 +3150,7 @@ mod tests {
             series_title: "WebDAV Retry".to_string(),
             season: 1,
             episode: 1.0,
+            uploads: Vec::new(),
         };
         client.fail_upload_at.store(2, Ordering::SeqCst);
 
@@ -2873,6 +3230,7 @@ mod tests {
             series_title: "Cross Storage".to_string(),
             season: 1,
             episode: 1.0,
+            uploads: Vec::new(),
         };
 
         transfer_group_between(&source, &target, &group, true, &|_, _, _, _| {})
@@ -2925,6 +3283,7 @@ mod tests {
             series_title: "Cross Storage".to_string(),
             season: 1,
             episode: 1.0,
+            uploads: Vec::new(),
         };
 
         let result = transfer_group_between(&source, &target, &group, true, &|_, _, _, _| {}).await;
@@ -3753,6 +4112,133 @@ mod tests {
                 .as_deref(),
             Some("pending")
         );
+    }
+
+    fn zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = ZipWriter::new(&mut cursor);
+        for (name, bytes) in files {
+            zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    #[tokio::test]
+    async fn extracts_subtitle_archive_into_the_episode_directory() {
+        let client = MockCloud::default();
+        let video = "/source/torrent/[ANi] Test Show - 01 [1080P].mkv";
+        let archive = "/source/torrent/[ANi] Test Show - Subtitles.zip";
+        let video_bytes = b"video-bytes".to_vec();
+        let subtitle = b"dialogue";
+        let archive_bytes = zip_bytes(&[("[ANi] Test Show - 01 [1080P].chs.ass", subtitle)]);
+        client.folders.lock().unwrap().extend([
+            ("/source".to_string(), vec![file("/source/torrent", true)]),
+            (
+                "/source/torrent".to_string(),
+                vec![
+                    file_with_size(video, false, video_bytes.len() as i64),
+                    file_with_size(archive, false, archive_bytes.len() as i64),
+                ],
+            ),
+            ("/library".to_string(), Vec::new()),
+        ]);
+        client.remote_bytes.lock().unwrap().extend([
+            (video.to_string(), video_bytes),
+            (archive.to_string(), archive_bytes),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let db = RssDatabase::new(&directory.path().join("rss.db")).unwrap();
+        let id = db
+            .add_subscription("https://example.test/rss", None, "/source", 300)
+            .unwrap();
+        db.update_subscription_organization_settings(id, true, Some("/library"), false, true)
+            .unwrap();
+        db.save_download_task(id, "rss-item").unwrap();
+        db.save_download_correlation(
+            id,
+            "rss-item",
+            "abcdef1234567890abcdef1234567890abcdef12",
+            None,
+        )
+        .unwrap();
+
+        let summary =
+            organize_subscription(&db, &db.get_subscription(id).unwrap().unwrap(), &client)
+                .await
+                .unwrap();
+
+        assert_eq!(summary.moved_media, 1);
+        assert_eq!(summary.moved_files, 2);
+        assert_eq!(summary.removed_empty_directories, 1);
+        let stored = client.remote_bytes.lock().unwrap();
+        assert_eq!(
+            stored
+                .get("/library/Test Show/[ANi] Test Show - 01 [1080P].chs.ass")
+                .map(Vec::as_slice),
+            Some(subtitle.as_slice())
+        );
+        assert!(!stored.contains_key(archive));
+        assert!(!stored.keys().any(|path| path.ends_with(".exe")));
+        drop(stored);
+        let deletes = client.deletes.lock().unwrap();
+        assert!(deletes.iter().any(|path| path == archive));
+        assert!(deletes.iter().any(|path| path == "/source/torrent"));
+    }
+
+    #[tokio::test]
+    async fn rejects_zip_slip_archive_and_still_moves_the_video() {
+        let client = MockCloud::default();
+        let video = "/source/torrent/[ANi] Test Show - 01 [1080P].mkv";
+        let archive = "/source/torrent/Subtitles.zip";
+        let video_bytes = b"video-bytes".to_vec();
+        let archive_bytes = zip_bytes(&[("../../evil.exe", b"MZ"), ("payload.exe", b"MZ")]);
+        client.folders.lock().unwrap().extend([
+            ("/source".to_string(), vec![file("/source/torrent", true)]),
+            (
+                "/source/torrent".to_string(),
+                vec![
+                    file_with_size(video, false, video_bytes.len() as i64),
+                    file_with_size(archive, false, archive_bytes.len() as i64),
+                ],
+            ),
+            ("/library".to_string(), Vec::new()),
+        ]);
+        client
+            .remote_bytes
+            .lock()
+            .unwrap()
+            .insert(archive.to_string(), archive_bytes);
+        let directory = tempfile::tempdir().unwrap();
+        let db = RssDatabase::new(&directory.path().join("rss.db")).unwrap();
+        let id = configured_subscription(&db);
+
+        let summary =
+            organize_subscription(&db, &db.get_subscription(id).unwrap().unwrap(), &client)
+                .await
+                .unwrap();
+
+        assert_eq!(summary.moved_media, 1);
+        assert_eq!(summary.moved_files, 1);
+        assert_eq!(client.upload_calls.load(Ordering::SeqCst), 0);
+        assert!(client.remote_bytes.lock().unwrap().contains_key(archive));
+        assert!(!client
+            .remote_bytes
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|path| path.contains("evil.exe") || path.ends_with("payload.exe")));
+        assert!(client
+            .folders
+            .lock()
+            .unwrap()
+            .get("/source/torrent")
+            .is_some_and(|entries| entries.iter().any(|entry| entry.name == "Subtitles.zip")));
+        assert!(client.deletes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
