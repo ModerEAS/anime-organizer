@@ -19,7 +19,7 @@ clap = { version = "4.4", features = ["derive"] }
 regex = "1.10"
 thiserror = "1.0"
 walkdir = "2.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream", "system-proxy", "gzip", "deflate", "brotli"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream", "system-proxy", "gzip", "deflate", "brotli", "socks"], optional = true }
 axum = { version = "0.7.9", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -39,6 +39,8 @@ prost = { version = "0.13", optional = true }
 prost-types = { version = "0.13", optional = true }
 sha1 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
+tar = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
 bt_bencode = { version = "0.8", optional = true }
 async-trait = { version = "0.1", optional = true }
 tower = { version = "0.5", optional = true }
@@ -60,8 +62,9 @@ tempfile = "3.9"
 tokio = { version = "1", features = ["full"] }
 
 [features]
-default = ["metadata", "daemon"]
+default = ["metadata", "daemon", "self-update"]
 daemon = ["dep:axum", "dep:tokio", "dep:url"]
+self-update = ["dep:reqwest", "dep:tokio", "dep:sha2", "dep:flate2", "dep:tar", "dep:tokio-util", "dep:libc"]
 anifilebert = ["dep:flate2", "dep:ndarray", "dep:ort"]
 anifilebert-directml = ["anifilebert", "ort/directml"]
 anifilebert-amd-npu = ["anifilebert-directml"]

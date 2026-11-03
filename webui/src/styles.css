@@ -161,6 +161,8 @@ dd { color: #35424b; margin: 3px 0 0; overflow-wrap: anywhere; }
 .job-log-line.warning span { color: #f0cf83; }
 .job-log .empty-state { color: #9ca8b1; padding: 12px 14px; }
 .about-grid { display: grid; gap: 20px; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 20px; }
+.about-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.update-message { color: #36444d; margin: 8px 0 0; white-space: pre-wrap; }
 .about-grid strong, .about-grid code { color: #36444d; display: block; overflow-wrap: anywhere; }
 .scraper-forms { display: grid; gap: 28px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .maintenance-grid { display: grid; gap: 28px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 25px; }

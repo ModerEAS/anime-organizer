@@ -83,6 +83,10 @@ pub enum AppError {
     #[error("操作已取消")]
     Canceled,
 
+    /// 程序自身更新失败
+    #[error("程序更新失败: {0}")]
+    SelfUpdate(String),
+
     /// Torrent 页面获取失败
     #[error("Torrent 获取失败: {0}")]
     TorrentFetchError(String),

@@ -85,6 +85,25 @@ cargo build --release --features "anifilebert-directml"
 
 如果本机默认是 GNU Rust 工具链，Windows 上验证 AniFileBERT/DirectML 时请显式指定 MSVC `rustc`。若 ONNX Runtime 在本地链接阶段报错，可将 `ORT_LIB_LOCATION` 指向解压后的 ORT 目录，并设置 `ORT_PREFER_DYNAMIC_LINK=1` 改走 import-lib/dll 路线。
 
+### 程序自身更新
+
+`aniorg update` 查询本仓库最新的 GitHub Release，只下载当前平台那一个压缩包和旁边的 `.sha256`，核对一致后再替换正在运行的程序，并按原来的参数重启。`aniorg update --check` 只查询，不下载。
+
+比较时同时看 `MAJOR.MINOR.PATCH` 和 master 发布使用的 `+构建号`。两者都相同、并且本地和远端都能读到提交号时，提交号不同也算新构建。远端更旧时不会降级。校验、路径或可执行文件头不对时，不会覆盖当前程序。
+
+`aniorg --daemon` 默认每 6 小时检查一次；间隔写成短于 5 分钟时按 5 分钟执行。发现新构建后会自动替换并重启。`target/debug` 和 `target/release` 里的开发构建只提示，不自动替换。关于页的「更新并重启」以及命令行的 `aniorg update` 仍然会替换。有整理任务在跑时，会等任务结束再重启。
+
+设置写在数据目录的 `update.json`（和 `daemon.db` 同一层），关于页也可以改：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `app_update_interval` | `6h` | `off` 关闭自动检查 |
+| `auto_apply_app_update` | `true` | 发现新构建后自动替换 |
+| `app_update_feed` | 空 | 空则使用 GitHub 最新 Release。只允许 https，或本机上的 http |
+| `proxy` | 空 | 空则依次看 `ALL_PROXY`、`HTTPS_PROXY`、`HTTP_PROXY` 及对应小写变量；`off` 表示直连 |
+
+访问本机回环地址不会送进代理。代理里的账号和密码不会出现在页面上。`ANIORG_GITHUB_TOKEN` 或 `GITHUB_TOKEN` 只用于请求 `api.github.com`，用来提高接口限额。
+
 ### Daemon 与 WebUI
 
 Windows 使用以下唯一入口启动本地 daemon：
@@ -816,6 +835,25 @@ cargo build --release --features "anifilebert-directml"
 The compiled binary is located at `target/release/aniorg`. `ANIORG_BERT_PROVIDER=cpu|auto|directml-gpu|directml-npu|directml-any` controls the ONNX Runtime provider; `ANIORG_DIRECTML_DEVICE_ID=0` pins a DirectML device. Without `anifilebert-directml`, the parser uses CPU. With it, the default is `auto`: try DirectML GPU first, then fall back to CPU. CPU threads can be tuned with `ANIORG_ORT_INTRA_THREADS` and `ANIORG_ORT_INTER_THREADS`; both default to `1`. `anifilebert-amd-npu` remains as a compatibility alias for `anifilebert-directml`; VitisAI requires an additional ONNX Runtime provider package and is not part of the default build.
 
 If your local Windows machine defaults to the GNU Rust toolchain, validate AniFileBERT/DirectML builds with the MSVC `rustc` explicitly. If ONNX Runtime fails during the local link step, point `ORT_LIB_LOCATION` at the extracted ORT directory and set `ORT_PREFER_DYNAMIC_LINK=1` to use the import-lib/dll path.
+
+### Self-update
+
+`aniorg update` checks the latest GitHub Release, downloads only the archive for the current target plus its `.sha256`, verifies the hash, then replaces the running program and restarts it with the original arguments. `aniorg update --check` reports availability and does not download.
+
+Comparison uses `MAJOR.MINOR.PATCH` and the `+BUILD` number published from `master`. When both the version and build number match, and both sides have a commit id, a different commit is also an update. Older releases are not installed. A failed checksum, path check, or executable header leaves the current program in place.
+
+`aniorg --daemon` checks every 6 hours by default. Intervals shorter than 5 minutes run every 5 minutes. A newer build is downloaded and the daemon restarts itself. Binaries under `target/debug` or `target/release` only show a notice. The About page action “Update and restart” and `aniorg update` still replace those builds. A running organize job delays the restart until it finishes.
+
+Settings live in `update.json` beside `daemon.db` and can also be edited on the About page:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `app_update_interval` | `6h` | `off` disables the schedule |
+| `auto_apply_app_update` | `true` | replace the program when a newer build is found |
+| `app_update_feed` | empty | empty uses the GitHub latest release. Only `https`, or `http` on loopback, is accepted |
+| `proxy` | empty | empty uses the first of `ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY` and their lowercase forms; `off` forces a direct connection |
+
+Loopback requests bypass the proxy. Proxy usernames and passwords are not shown in the page. `ANIORG_GITHUB_TOKEN` or `GITHUB_TOKEN` is sent only to `api.github.com`.
 
 ### Daemon and WebUI
 

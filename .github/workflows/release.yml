@@ -79,6 +79,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          ANIORG_GIT_SHA: ${{ github.sha }}
 
       - name: Prepare archive (Unix)
         if: matrix.os != 'windows-latest'
@@ -87,6 +88,12 @@ jobs:
           strip aniorg || true
           tar czvf ../../../aniorg-${{ matrix.target }}.tar.gz aniorg
           cd ../../..
+          archive="aniorg-${{ matrix.target }}.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
 
       - name: Prepare archive (Windows)
         if: matrix.os == 'windows-latest'
@@ -94,12 +101,18 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../aniorg-${{ matrix.target }}.zip aniorg.exe ${{ matrix.extra_files }}
           cd ../../..
+          $archive = "aniorg-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          $name = Split-Path $archive -Leaf
+          "$hash  $name" | Out-File -Encoding ascii "$archive.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: aniorg-${{ matrix.target }}
-          path: aniorg-${{ matrix.target }}.${{ matrix.archive }}
+          path: |
+            aniorg-${{ matrix.target }}.${{ matrix.archive }}
+            aniorg-${{ matrix.target }}.${{ matrix.archive }}.sha256
 
   release:
     name: Create Release

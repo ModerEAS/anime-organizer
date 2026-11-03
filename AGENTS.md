@@ -28,6 +28,7 @@ Rust CLI工具，批量整理动漫视频文件（硬链接/移动/复制），�
 | Task | Location | Notes |
 |------|----------|-------|
 | 添加新CLI参数 | src/main.rs | clap derive，`OrganizeArgs`/`Commands` |
+| 程序自身更新 | src/self_update.rs、src/daemon/app_update.rs | GitHub Release、SHA256、同目录替换；`aniorg update` |
 | 修改文件名解析规则 | src/parser.rs | `ANIME_FILE_REGEX` |
 | 文件操作逻辑 | src/organizer.rs | `FileOrganizer::organize_to_dir` |
 | 新增错误类型 | src/error.rs | thiserror枚举 |

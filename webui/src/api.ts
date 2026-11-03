@@ -2,7 +2,34 @@ export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled
 export type JobArtifact = { id: number; name: string; content_type: string; size: number; download_url: string }
 export type JobLog = { id: number; level: string; message: string; created_at: string }
 export type Job = { id: number; idempotency_key: string | null; origin: string; kind: string; resource_key: string | null; request: unknown; state: JobState; priority: number; attempts: number; progress_current: number | null; progress_total: number | null; progress_message: string | null; cancel_requested: boolean; cancelable: boolean; result: unknown; error: string | null; created_at: string; started_at: string | null; finished_at: string | null }
-export type Status = { uptime_seconds: number; worker_state: string; current_job_id: number | null; queue_counts: Record<JobState, number>; database_path: string }
+export type AppUpdatePhase = 'idle' | 'checking' | 'downloading' | 'verifying' | 'applying' | 'up_to_date' | 'failed'
+export type AppUpdateState = {
+  current_version: string
+  current_commit: string | null
+  latest_version: string | null
+  latest_commit: string | null
+  phase: AppUpdatePhase
+  percent: number
+  bytes: number
+  total: number | null
+  message: string
+  error: string | null
+  update_available: boolean
+  next_check_unix_ms: number | null
+  interval: string
+  auto_apply: boolean
+  feed: string
+  proxy: string
+  proxy_display: string
+  cargo_target: boolean
+}
+export type AppUpdateSettings = {
+  app_update_interval: string
+  auto_apply_app_update: boolean
+  app_update_feed: string | null
+  proxy: string | null
+}
+export type Status = { uptime_seconds: number; worker_state: string; current_job_id: number | null; queue_counts: Record<JobState, number>; database_path: string; app_update?: AppUpdateState }
 export type Capabilities = { features: string[]; job_types: string[]; resources: string[] }
 export type OrganizeArgs = {
   source: string | null
@@ -104,4 +131,7 @@ export const api = {
   deleteConnection: (id: number) => request<void>(`/cloud/connections/${id}`, { method: 'DELETE' }),
   testConnection: (id: number) => request<{ ok: boolean }>(`/cloud/connections/${id}/test`, { method: 'POST' }),
   listFolder: (id: number, path: string) => request<{ entries: FolderEntry[] }>(`/cloud/connections/${id}/list-folder`, { method: 'POST', body: JSON.stringify({ path }) }),
+  saveAppUpdateSettings: (value: AppUpdateSettings) => request<AppUpdateState>('/app-update/settings', { method: 'PUT', body: JSON.stringify(value) }),
+  checkAppUpdate: () => request<{ ok: boolean }>('/app-update/check', { method: 'POST' }),
+  applyAppUpdate: () => request<{ ok: boolean }>('/app-update/apply', { method: 'POST' }),
 }
