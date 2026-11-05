@@ -29,6 +29,7 @@ export type AppUpdateSettings = {
   app_update_feed: string | null
   proxy: string | null
 }
+export type MetadataSettings = { auto_download_alias_db: boolean }
 export type Status = { uptime_seconds: number; worker_state: string; current_job_id: number | null; queue_counts: Record<JobState, number>; database_path: string; app_update?: AppUpdateState }
 export type Capabilities = { features: string[]; job_types: string[]; resources: string[] }
 export type OrganizeArgs = {
@@ -131,6 +132,8 @@ export const api = {
   deleteConnection: (id: number) => request<void>(`/cloud/connections/${id}`, { method: 'DELETE' }),
   testConnection: (id: number) => request<{ ok: boolean }>(`/cloud/connections/${id}/test`, { method: 'POST' }),
   listFolder: (id: number, path: string) => request<{ entries: FolderEntry[] }>(`/cloud/connections/${id}/list-folder`, { method: 'POST', body: JSON.stringify({ path }) }),
+  metadataSettings: () => request<MetadataSettings>('/metadata/settings'),
+  saveMetadataSettings: (value: MetadataSettings) => request<MetadataSettings>('/metadata/settings', { method: 'PUT', body: JSON.stringify(value) }),
   saveAppUpdateSettings: (value: AppUpdateSettings) => request<AppUpdateState>('/app-update/settings', { method: 'PUT', body: JSON.stringify(value) }),
   checkAppUpdate: () => request<{ ok: boolean }>('/app-update/check', { method: 'POST' }),
   applyAppUpdate: () => request<{ ok: boolean }>('/app-update/apply', { method: 'POST' }),

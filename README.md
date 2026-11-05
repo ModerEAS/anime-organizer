@@ -232,6 +232,8 @@ aniorg --source="/path/to/downloads" --dry-run --verbose
 
 未指定 `--metadata-source` 时，元数据模式会按 24 小时 TTL 刷新固定发布地址的 AnimeAtlas `animeatlas.sqlite`；daemon 还会每小时检查一次缓存，过期后自动刷新。刷新失败会继续使用现有缓存。显式指定 `--metadata-source` 表示使用本地数据并保持离线，不会触发 AnimeAtlas 自动下载；`--alias-file` JSON 仍具有最高优先级。
 
+别名匹配优先使用本仓库每周日构建的全量库 `bangumi.db`（3 万余部动画，含 infobox 的「中文名 / 别名 / 英文名」，约 120 MB），缓存 7 天后自动更新；AnimeAtlas 只在它不可用时兜底。不想自动下载可以在 WebUI 的「关于 → 元数据数据源」关闭（写入数据目录的 `metadata.json`），关闭后只使用本地已有的 `bangumi.db`。
+
 `--alias-file` 可直接复用 `extract-aliases` 导出的 JSON 对象格式，例如：
 
 ```json
@@ -946,6 +948,8 @@ When `--scrape-metadata` is enabled, the tool will:
 The default cache is `%LOCALAPPDATA%\anime-organizer\bangumi-cache` on Windows (falling back to `%APPDATA%`) and `$XDG_CACHE_HOME/anime-organizer/bangumi-cache` or `~/.cache/anime-organizer/bangumi-cache` on Linux/macOS. Override it with `--bangumi-cache`; the cache is not placed inside the media target by default.
 
 Without `--metadata-source`, metadata modes refresh AnimeAtlas `animeatlas.sqlite` from its fixed release URL with a 24-hour TTL. The daemon also checks the cache hourly and refreshes it after expiry; failures keep the existing cache. An explicit `--metadata-source` selects local offline data and does not trigger AnimeAtlas downloads. A JSON `--alias-file` remains the highest-priority override.
+
+Alias matching prefers the full weekly `bangumi.db` built by this repository every Sunday (about 31k anime with the infobox Chinese/localized titles and aliases, roughly 120 MB). It is cached for seven days and refreshed automatically; AnimeAtlas is only a fallback. Automatic download can be turned off in the WebUI under About → Metadata data source, which writes `metadata.json` in the data directory; when disabled only a `bangumi.db` already on disk is used.
 
 The `--alias-file` JSON can reuse the object output format from `extract-aliases`, for example:
 

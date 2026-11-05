@@ -40,6 +40,13 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
             "/api/v1/jobs/:id/artifacts/:artifact_id",
             get(download_artifact),
         );
+    #[cfg(feature = "metadata")]
+    {
+        router = router.route(
+            "/api/v1/metadata/settings",
+            get(get_metadata_settings).put(update_metadata_settings),
+        );
+    }
     #[cfg(feature = "self-update")]
     {
         router = router
@@ -239,6 +246,31 @@ async fn status(State(state): State<Arc<DaemonState>>) -> Response {
         app_update: crate::daemon::app_update::snapshot(&state),
     })
     .into_response()
+}
+
+/// 读取 `metadata.json`。没有文件时返回默认值（自动下载全量别名库）。
+#[cfg(feature = "metadata")]
+async fn get_metadata_settings() -> Response {
+    let path = crate::metadata_settings::MetadataSettings::path();
+    match crate::metadata_settings::MetadataSettings::load(&path) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", message),
+    }
+}
+
+/// 保存 `metadata.json`，返回落盘后的实际内容。
+#[cfg(feature = "metadata")]
+async fn update_metadata_settings(
+    Json(settings): Json<crate::metadata_settings::MetadataSettings>,
+) -> Response {
+    let path = crate::metadata_settings::MetadataSettings::path();
+    if let Err(message) = crate::metadata_settings::MetadataSettings::save(&path, &settings) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", message);
+    }
+    match crate::metadata_settings::MetadataSettings::load(&path) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(message) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", message),
+    }
 }
 
 #[cfg(feature = "self-update")]

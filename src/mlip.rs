@@ -6,7 +6,8 @@ use anime_organizer::metadata::{
 };
 use anime_organizer::nfo::{EpisodeNfo, NfoWriter, UniqueId};
 use anime_organizer::{
-    parser::split_series_and_season, AnimeFileInfo, AnimeMetadata, LibraryIndexRecord,
+    parser::{split_series_and_season, strip_residual_tags},
+    AnimeFileInfo, AnimeMetadata, LibraryIndexRecord,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -116,6 +117,11 @@ pub(crate) async fn fetch_anime_metadata(
         cached_bangumi_id,
         allow_online_title_resolution,
     } = lookup;
+    // 名字末尾残留的发布标签（如 `[中文配音]`）会让整条匹配失配，先剥掉再查。
+    let clean_anime = strip_residual_tags(anime_name);
+    let clean_series = strip_residual_tags(series_name);
+    let anime_name = clean_anime.as_str();
+    let series_name = clean_series.as_str();
     let mut metadata = None;
     let mut anidb_id = None;
     let mut lookup_queries =
@@ -239,14 +245,17 @@ pub(crate) async fn fetch_anime_metadata(
                 }
             }
 
-            if metadata.is_none() && resolved.titles.iter().all(|title| is_latin_title(title)) {
-                lookup_queries.clear();
+            // 解析结果全是拉丁文且仍无匹配时，不再清空候选：保留原始名字还能让
+            // Bangumi 在线搜索命中（实测 Tantei wa Mou, Shindeiru. S2 就是这样救回来的）。
+            if metadata.is_none()
+                && resolved.titles.iter().all(|title| is_latin_title(title))
+                && verbose
+            {
+                eprintln!("拉丁标题解析未直接命中，继续用名称/在线搜索兜底: {anime_name}");
             }
-        } else {
-            if verbose {
-                eprintln!("跳过不安全的拉丁标题模糊匹配: {anime_name}");
-            }
-            lookup_queries.clear();
+        } else if verbose {
+            // 拉丁标题解析失败时保留原始查询，交给本地模糊搜索与在线搜索。
+            eprintln!("拉丁标题解析未命中，继续用名称/在线搜索兜底: {anime_name}");
         }
     }
 
@@ -825,9 +834,13 @@ fn bangumi_subject_match_score(
         .or_else(|| use_bert_season.then(|| bert_season_hint(query)).flatten());
     let query_has_han = contains_han(query);
     let ascii_tokens = distinctive_ascii_tokens(query);
-    [Some(subject.name.as_str()), subject.name_cn.as_deref()]
+    let mut candidates: Vec<&str> = vec![subject.name.as_str()];
+    candidates.extend(subject.name_cn.as_deref());
+    // infobox 里的「中文名 / 别名 / 英文名」是官方别名的主要来源，
+    // 以前只比 name 与 name_cn，等于把 Archive 里的两万条别名全丢掉了。
+    candidates.extend(subject.aliases.iter().map(String::as_str));
+    candidates
         .into_iter()
-        .flatten()
         .map(|title| {
             let candidate_season = title_season_hint(title)
                 .or_else(|| use_bert_season.then(|| bert_season_hint(title)).flatten())
@@ -1384,7 +1397,15 @@ mod tests {
             tags: Vec::new(),
             meta_tags: Vec::new(),
             images: None,
+            aliases: Vec::new(),
         }
+    }
+
+    #[test]
+    fn local_search_matches_infobox_alias() {
+        let mut subject = bangumi_subject(4242, "仮面ライダーMY-TH", "假面骑士 MY-TH");
+        subject.aliases = vec!["假面騎士 MY-TH".to_string()];
+        assert!(bangumi_subject_match_score("假面騎士 MY-TH", &subject, false) >= 0.72);
     }
 
     #[test]

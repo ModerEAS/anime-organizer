@@ -527,3 +527,119 @@ impl FilenameParser {
         )
     }
 }
+
+/// 剥掉番名末尾残留的发布标签，例如 `[中文配音]`、`[1080p]`、`[Baha][WEB-DL]`。
+///
+/// 规则解析器遇到 `[组] 番名 [标签] - 01` 这类写法时，会把标签留在番名末尾。
+/// 这种名字去做 Bangumi 匹配会整体失配（例如 `假面騎士 MY-TH [中文配音]` 谁都搜不到）。
+/// 只处理**末尾**的方括号组，且内容必须像发布标签才删除，
+/// 避免误伤 `[我推的孩子]` 这种正式标题。
+#[must_use]
+pub fn strip_residual_tags(name: &str) -> String {
+    const SEPARATORS: [char; 6] = [' ', '-', '/', '／', '|', '　'];
+    let mut value = name.trim().to_string();
+    loop {
+        let trimmed = value.trim_end_matches(SEPARATORS);
+        if trimmed.len() != value.len() {
+            value = trimmed.to_string();
+        }
+        let Some((start, inner)) = trailing_bracket_group(&value) else {
+            break;
+        };
+        if !looks_like_release_tag(inner) {
+            break;
+        }
+        let head = value[..start].trim_end();
+        if head.is_empty() {
+            break;
+        }
+        value = head.to_string();
+    }
+    value
+}
+
+fn trailing_bracket_group(value: &str) -> Option<(usize, &str)> {
+    let trimmed = value.trim_end();
+    let close = trimmed.chars().next_back()?;
+    let open = match close {
+        ']' => '[',
+        '］' => '［',
+        _ => return None,
+    };
+    let start = trimmed.rfind(open)?;
+    let inner_start = start + open.len_utf8();
+    let inner_end = trimmed.len() - close.len_utf8();
+    if inner_start > inner_end {
+        return None;
+    }
+    let inner = &trimmed[inner_start..inner_end];
+    if inner.contains(['[', ']', '［', '］']) {
+        return None;
+    }
+    Some((start, inner))
+}
+
+fn looks_like_release_tag(inner: &str) -> bool {
+    let value = inner.trim();
+    if value.is_empty() || value.chars().count() > 40 {
+        return false;
+    }
+    const CJK_TAGS: &[&str] = &[
+        "简",
+        "繁",
+        "内嵌",
+        "内封",
+        "外挂",
+        "字幕",
+        "中文",
+        "配音",
+        "日语",
+        "双语",
+        "多语",
+        "合集",
+        "无修",
+        "完全版",
+        "修正",
+        "招募",
+    ];
+    if CJK_TAGS.iter().any(|tag| value.contains(tag)) {
+        return true;
+    }
+    const ASCII_TAGS: &[&str] = &[
+        "1080", "720", "2160", "480", "576", "1080p", "720p", "2160p", "480p", "576p", "hevc",
+        "avc", "x264", "x265", "h264", "h265", "aac", "flac", "opus", "ac3", "dts", "web-dl",
+        "webdl", "webrip", "web", "bluray", "bdrip", "bd", "dvdrip", "hdtv", "10bit", "8bit",
+        "10-bit", "8-bit", "chs", "cht", "gb", "big5", "repack", "v2", "v3", "fin", "baha",
+        "b-global", "amzn", "nf", "hulu", "dmm", "abema", "vcb", "ma10p", "hi10p", "utf-8", "sub",
+    ];
+    value
+        .to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '-')
+        .any(|token| !token.is_empty() && ASCII_TAGS.contains(&token))
+}
+
+#[cfg(test)]
+mod residual_tag_tests {
+    use super::strip_residual_tags;
+
+    #[test]
+    fn strips_release_tags_at_the_end() {
+        assert_eq!(
+            strip_residual_tags("假面騎士 MY-TH [中文配音]"),
+            "假面騎士 MY-TH"
+        );
+        assert_eq!(strip_residual_tags("番名 [1080p][Baha][WEB-DL]"), "番名");
+        assert_eq!(strip_residual_tags("番名 [简繁日内嵌]"), "番名");
+        assert_eq!(strip_residual_tags("番名 [10bit] - "), "番名");
+    }
+
+    #[test]
+    fn keeps_bracketed_real_titles() {
+        assert_eq!(strip_residual_tags("[我推的孩子]"), "[我推的孩子]");
+        assert_eq!(strip_residual_tags("葬送的芙莉莲"), "葬送的芙莉莲");
+        assert_eq!(
+            strip_residual_tags("Re:Zero kara Hajimeru Isekai Seikatsu"),
+            "Re:Zero kara Hajimeru Isekai Seikatsu"
+        );
+    }
+}

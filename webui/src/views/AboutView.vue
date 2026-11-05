@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from 'vue'
+import { computed, onMounted, reactive, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { api, errorMessage, type AppUpdateState } from '../api'
 import { t, valueLabel } from '../i18n'
@@ -23,6 +23,32 @@ const form = reactive({
   error: '',
 })
 const busy = computed(() => ['checking', 'downloading', 'verifying', 'applying'].includes(update.value?.phase ?? ''))
+const metadata = reactive({ autoDownload: true, loading: true, saving: false, dirty: false, error: '' })
+
+onMounted(async () => {
+  try {
+    const settings = await api.metadataSettings()
+    metadata.autoDownload = settings.auto_download_alias_db
+  } catch (error) {
+    metadata.error = errorMessage(error)
+  } finally {
+    metadata.loading = false
+  }
+})
+
+async function saveMetadata() {
+  metadata.saving = true
+  metadata.error = ''
+  try {
+    const settings = await api.saveMetadataSettings({ auto_download_alias_db: metadata.autoDownload })
+    metadata.autoDownload = settings.auto_download_alias_db
+    metadata.dirty = false
+  } catch (error) {
+    metadata.error = errorMessage(error)
+  } finally {
+    metadata.saving = false
+  }
+}
 
 watch(update, (value) => {
   if (!value || form.dirty) return
@@ -126,6 +152,16 @@ async function apply() {
         <button class="button secondary" type="button" :disabled="busy || form.acting" @click="check">{{ t('Check for updates') }}</button>
         <button class="button primary" type="button" :disabled="busy || form.acting" @click="apply">{{ t('Update and restart') }}</button>
       </div>
+    </form>
+  </section>
+  <section class="section-block" aria-labelledby="metadata-heading">
+    <div class="section-heading"><div><p class="eyebrow">{{ t('Metadata') }}</p><h2 id="metadata-heading">{{ t('Metadata data source') }}</h2></div></div>
+    <p class="page-subtitle">{{ t('Choose which offline Bangumi data this machine downloads.') }}</p>
+    <p v-if="metadata.error" class="alert error" role="alert">{{ metadata.error }}</p>
+    <form class="form-grid" @submit.prevent="saveMetadata">
+      <label class="checkbox-field"><input v-model="metadata.autoDownload" type="checkbox" :disabled="metadata.loading" @change="metadata.dirty = true"><span>{{ t('Automatically download the weekly full alias database (bangumi.db, about 120 MB)') }}</span></label>
+      <p class="notice">{{ t('When disabled, only a bangumi.db already on disk is used; otherwise the program falls back to the small AnimeAtlas database.') }}</p>
+      <div class="about-actions"><button class="button secondary" type="submit" :disabled="metadata.saving || metadata.loading || !metadata.dirty">{{ t('Save metadata settings') }}</button></div>
     </form>
   </section>
   <section class="section-block" aria-labelledby="capabilities-heading"><div class="section-heading"><div><p class="eyebrow">{{ t('Runtime') }}</p><h2 id="capabilities-heading">{{ t('Capabilities') }}</h2></div></div><div v-if="state.capabilities" class="capability-list"><span v-for="feature in state.capabilities.features" :key="feature" class="capability">{{ valueLabel(feature) }}</span></div><p v-else class="empty-state">{{ t('Capabilities are unavailable while the daemon is offline.') }}</p></section>

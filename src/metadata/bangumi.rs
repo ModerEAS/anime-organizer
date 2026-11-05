@@ -33,6 +33,9 @@ const SUBJECT_DUMP_FILENAME: &str = "subject.jsonlines";
 /// 本地 dump 版本 sidecar 文件名（内容为 release asset 名，如 `dump-2026-10-06.210359Z.zip`）。
 const DUMP_VERSION_FILENAME: &str = "subject.jsonlines.version";
 
+/// 本地 dump 的刷新检查间隔：24 小时内不再请求远端版本信息。
+const DUMP_REFRESH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Bangumi Archive dump can be hundreds of MB.
 const BANGUMI_ARCHIVE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -84,6 +87,36 @@ pub struct BangumiSubject {
     /// Bangumi v0 API 返回的封面图集合；Archive dump 中通常不存在。
     #[serde(default)]
     pub images: Option<BangumiImages>,
+    /// 从 `infobox` 抽取的别名（中文名 / 别名 / 英文名）。
+    ///
+    /// Archive 不提供独立的别名字段，别名都写在 infobox 的 wiki 文本里；
+    /// 这里在载入 dump 时解析一次，供名称匹配使用。
+    #[serde(skip)]
+    pub aliases: Vec<String>,
+}
+
+/// 从 infobox 文本中抽取可用于匹配的别名。
+#[must_use]
+pub fn infobox_aliases(infobox: Option<&str>) -> Vec<String> {
+    let Some(text) = infobox else {
+        return Vec::new();
+    };
+    let Ok(fields) = WikiParser::new().parse(text) else {
+        return Vec::new();
+    };
+    let mut aliases: Vec<String> = Vec::new();
+    for key in ["中文名", "别名", "英文名"] {
+        let Some(value) = fields.get(key) else {
+            continue;
+        };
+        for item in value.split(" / ") {
+            let item = item.trim();
+            if !item.is_empty() && !aliases.iter().any(|existing| existing == item) {
+                aliases.push(item.to_string());
+            }
+        }
+    }
+    aliases
 }
 
 fn deserialize_optional_string<'de, D>(
@@ -480,7 +513,11 @@ impl BangumiClient {
             .map_err(|e| AppError::BangumiParseError(format!("锁定索引失败: {e}")))?;
         if let Some(subject) = index.as_ref().and_then(|idx| {
             idx.values()
-                .find(|s| s.name == name || s.name_cn.as_deref() == Some(name))
+                .find(|s| {
+                    s.name == name
+                        || s.name_cn.as_deref() == Some(name)
+                        || s.aliases.iter().any(|alias| alias == name)
+                })
                 .cloned()
         }) {
             return Ok(Some(subject));
@@ -660,9 +697,10 @@ impl BangumiClient {
                 continue;
             }
 
-            if let Ok(subject) = serde_json::from_str::<BangumiSubject>(line) {
+            if let Ok(mut subject) = serde_json::from_str::<BangumiSubject>(line) {
                 // 仅保留动画类型
                 if subject.subject_type == 2 {
+                    subject.aliases = infobox_aliases(subject.infobox.as_deref());
                     subjects.insert(subject.id, subject);
                 }
             }
@@ -678,7 +716,12 @@ impl BangumiClient {
         Ok(count)
     }
 
-    /// 准备本地索引：优先加载现有 dump；若不存在则尝试下载。
+    /// 准备本地索引：优先加载现有 dump；按 TTL 检查远端版本，过期就刷新。
+    ///
+    /// 以前这里只要有本地文件就直接用，CLI 用户永远停在第一次下载的那份快照上，
+    /// 新番在本地库里根本不存在。现在与守护进程一致：先看 sidecar 版本是否过期，
+    /// 过期才去拉 500 字节的 `latest.json` 比对 asset 名，真的变了才重新下载。
+    /// 任何一步失败都继续使用现有缓存。
     #[cfg(feature = "metadata")]
     pub async fn prepare_index(&self) -> Result<usize> {
         if let Some(len) = self.index_len()? {
@@ -686,11 +729,39 @@ impl BangumiClient {
         }
 
         if let Some(path) = self.resolve_existing_dump_path() {
+            if self.dump_refresh_due().await {
+                if let Ok(fresh) = self.download_dump().await {
+                    return self.load_dump(&fresh);
+                }
+            }
             return self.load_dump(&path);
         }
 
         let dump_path = self.download_dump().await?;
         self.load_dump(&dump_path)
+    }
+
+    /// 本地 dump 是否该检查/执行刷新（TTL 内直接返回 false，避免每次启动都请求远端）。
+    #[cfg(feature = "metadata")]
+    async fn dump_refresh_due(&self) -> bool {
+        let Some(version) = self.dump_version() else {
+            return true;
+        };
+        let sidecar = self.cache_dir.join(DUMP_VERSION_FILENAME);
+        let stale = match std::fs::metadata(&sidecar).and_then(|meta| meta.modified()) {
+            Ok(modified) => modified
+                .elapsed()
+                .map(|age| age >= DUMP_REFRESH_TTL)
+                .unwrap_or(true),
+            Err(_) => true,
+        };
+        if !stale {
+            return false;
+        }
+        match self.fetch_latest().await {
+            Ok(latest) => !latest.name.is_empty() && latest.name != version,
+            Err(_) => false,
+        }
     }
 
     fn index_len(&self) -> Result<Option<usize>> {
@@ -913,7 +984,17 @@ mod tests {
             tags: vec!["原创".to_string()],
             meta_tags: Vec::new(),
             images,
+            aliases: Vec::new(),
         }
+    }
+
+    #[test]
+    fn infobox_aliases_include_multi_value_block() {
+        let infobox = "{{Infobox animanga/TVAnime\n|中文名=黄泉使者\n|别名={\n[黃泉的使者]\n[Yomi no Tsugai]\n}\n|话数=24\n}}";
+        let aliases = infobox_aliases(Some(infobox));
+        assert!(aliases.contains(&"黄泉使者".to_string()));
+        assert!(aliases.contains(&"黃泉的使者".to_string()));
+        assert!(aliases.contains(&"Yomi no Tsugai".to_string()));
     }
 
     #[test]

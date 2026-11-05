@@ -9,8 +9,10 @@ mod commands;
 #[cfg(feature = "daemon")]
 mod daemon;
 #[cfg(feature = "metadata")]
+mod metadata_settings;
+#[cfg(feature = "metadata")]
 mod mlip;
-#[cfg(any(feature = "daemon", feature = "self-update"))]
+#[cfg(any(feature = "daemon", feature = "self-update", feature = "metadata"))]
 mod paths;
 #[cfg(feature = "self-update")]
 mod self_update;
@@ -32,8 +34,9 @@ use anime_organizer::archive_assets::{
 #[cfg(feature = "metadata")]
 use anime_organizer::library_index::{Artwork, ArtworkKind, ExternalProvider};
 use anime_organizer::{
-    error::AppError, organize_directory_components, sha256_file, AnimeFileInfo, FileOrganizer,
-    FilenameParser, LibraryExtraRecord, LibraryIndex, LibraryIndexRecord, OperationMode,
+    error::AppError, organize_directory_components, parser::strip_residual_tags, sha256_file,
+    AnimeFileInfo, FileOrganizer, FilenameParser, LibraryExtraRecord, LibraryIndex,
+    LibraryIndexRecord, OperationMode,
 };
 #[cfg(feature = "metadata")]
 use anime_organizer::{
@@ -48,6 +51,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "metadata")]
 use std::sync::Arc;
+#[cfg(feature = "metadata")]
+use tokio::io::AsyncWriteExt;
 use walkdir::WalkDir;
 
 /// 默认支持的视频扩展名
@@ -59,6 +64,19 @@ const ANIMEATLAS_SQLITE_URL: &str =
     "https://github.com/ModerRAS/AnimeAtlas/releases/download/download/animeatlas.sqlite";
 #[cfg(feature = "metadata")]
 const ANIMEATLAS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+#[cfg(feature = "metadata")]
+const BANGUMI_ALIAS_DB_FILENAME: &str = "bangumi.db";
+#[cfg(feature = "metadata")]
+const BANGUMI_ALIAS_DB_URL: &str =
+    "https://github.com/ModerRAS/anime-organizer/releases/download/bangumi-db-latest/bangumi.db";
+/// 全量别名库由 `bangumi-db.yml` 每周日重建，本地缓存同样按 7 天 TTL 复用。
+#[cfg(feature = "metadata")]
+const BANGUMI_ALIAS_DB_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+/// 全量库约 120 MB，明显偏小视为下载不完整。
+#[cfg(feature = "metadata")]
+const BANGUMI_ALIAS_DB_MIN_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "metadata")]
+static BANGUMI_ALIAS_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[cfg(feature = "metadata")]
 static ANIMEATLAS_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[cfg(feature = "metadata")]
@@ -1760,12 +1778,37 @@ fn parse_anime_file(
     verbose: bool,
 ) -> Result<Option<AnimeFileInfo>, AppError> {
     match mode {
-        FilenameParserMode::Rules => Ok(FilenameParser::parse(path)),
-        FilenameParserMode::Anifilebert => parse_anifilebert(path, true, verbose),
-        FilenameParserMode::Auto => match FilenameParser::parse(path) {
-            Some(info) => Ok(Some(info)),
-            None => parse_anifilebert(path, false, verbose),
-        },
+        FilenameParserMode::Rules => Ok(FilenameParser::parse(path).map(sanitize_anime_file)),
+        FilenameParserMode::Anifilebert => {
+            Ok(parse_anifilebert(path, true, verbose)?.map(sanitize_anime_file))
+        }
+        FilenameParserMode::Auto => {
+            let rules = FilenameParser::parse(path);
+            // 规则解析器"成功"不等于名字干净：末尾残留 `[中文配音]` 这类标签时，
+            // 元数据匹配会整体失配，这种情况也交给模型重新解析。
+            let rules_need_cleanup = rules
+                .as_ref()
+                .is_some_and(|info| strip_residual_tags(&info.anime_name) != info.anime_name);
+            if let (Some(info), false) = (rules.as_ref(), rules_need_cleanup) {
+                return Ok(Some(sanitize_anime_file(info.clone())));
+            }
+            match parse_anifilebert(path, false, verbose)? {
+                Some(info) => Ok(Some(sanitize_anime_file(info))),
+                None => Ok(rules.map(sanitize_anime_file)),
+            }
+        }
+    }
+}
+
+/// 去掉番名末尾残留的发布标签，让整理出的目录名与元数据查询都保持干净。
+fn sanitize_anime_file(info: AnimeFileInfo) -> AnimeFileInfo {
+    let cleaned = strip_residual_tags(&info.anime_name);
+    if cleaned.is_empty() || cleaned == info.anime_name {
+        return info;
+    }
+    AnimeFileInfo {
+        anime_name: cleaned,
+        ..info
     }
 }
 
@@ -1897,6 +1940,22 @@ async fn resolve_alias_db_path(
             .or_else(|| bangumi_path.is_file().then_some(bangumi_path));
     }
 
+    // 周更的全量库优先：它同时包含中文名与 infobox 别名。
+    //（AnimeAtlas 只有 91 部手工作品，实测全量库是 3 万部 / 2 万条别名。）
+    let allow_download = crate::metadata_settings::MetadataSettings::load(
+        &crate::metadata_settings::MetadataSettings::path(),
+    )
+    .unwrap_or_default()
+    .auto_download_alias_db;
+    if let Some(path) =
+        ensure_bangumi_alias_db(bangumi.cache_dir(), force_refresh, allow_download, verbose).await
+    {
+        if verbose {
+            eprintln!("使用全量别名库: {}", path.display());
+        }
+        return Some(path);
+    }
+
     match download_animeatlas_alias_db(bangumi.cache_dir(), force_refresh).await {
         Ok(path) => {
             if verbose {
@@ -1914,6 +1973,118 @@ async fn resolve_alias_db_path(
                 .or_else(|| bangumi_path.is_file().then_some(bangumi_path))
         }
     }
+}
+
+/// 确保本地有周更的全量别名库 `bangumi.db`，必要时下载。
+///
+/// 这份库由 `.github/workflows/bangumi-db.yml` 每周日从 Bangumi Archive 重建，
+/// 覆盖全部动画并带 infobox 别名（实测 31,258 部 / 20,196 条），
+/// 比 91 部的手工 AnimeAtlas 高一到两个数量级。
+/// 任何一步失败都返回既有缓存（可能过期），由调用方继续回退 AnimeAtlas。
+/// 是否允许下载由 `metadata.json` 的 `auto_download_alias_db` 控制（WebUI 可改）。
+#[cfg(feature = "metadata")]
+pub(crate) async fn ensure_bangumi_alias_db(
+    cache_dir: &Path,
+    force_refresh: bool,
+    allow_download: bool,
+    verbose: bool,
+) -> Option<PathBuf> {
+    let db_path = cache_dir.join(BANGUMI_ALIAS_DB_FILENAME);
+    if !force_refresh && bangumi_alias_db_is_fresh(&db_path) {
+        return Some(db_path);
+    }
+    // 设置里关掉了自动下载时，只认本地已有文件（可能过期）。
+    if !allow_download {
+        return db_path.is_file().then_some(db_path);
+    }
+
+    match download_bangumi_alias_db(cache_dir).await {
+        Ok(()) => {
+            if verbose {
+                eprintln!("全量别名库已更新: {}", db_path.display());
+            }
+            Some(db_path)
+        }
+        Err(error) => {
+            if verbose {
+                eprintln!("全量别名库下载失败，将继续使用现有缓存或回退 AnimeAtlas: {error}");
+            }
+            db_path.is_file().then_some(db_path)
+        }
+    }
+}
+
+#[cfg(feature = "metadata")]
+fn bangumi_alias_db_is_fresh(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() < BANGUMI_ALIAS_DB_MIN_BYTES {
+        return false;
+    }
+    match metadata.modified() {
+        Ok(modified) => modified
+            .elapsed()
+            .map(|age| age < BANGUMI_ALIAS_DB_TTL)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "metadata")]
+async fn download_bangumi_alias_db(cache_dir: &Path) -> Result<(), AppError> {
+    let _refresh_guard = BANGUMI_ALIAS_DB_LOCK.lock().await;
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| AppError::MetadataFetchError(format!("创建缓存目录失败: {e}")))?;
+
+    let db_path = cache_dir.join(BANGUMI_ALIAS_DB_FILENAME);
+    let tmp_path = cache_dir.join(format!("{BANGUMI_ALIAS_DB_FILENAME}.part"));
+    let client = reqwest::Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| AppError::MetadataFetchError(format!("创建 HTTP 客户端失败: {e}")))?;
+    let mut resp = client
+        .get(BANGUMI_ALIAS_DB_URL)
+        .send()
+        .await
+        .map_err(|e| AppError::MetadataFetchError(format!("下载全量别名库失败: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(AppError::MetadataFetchError(format!(
+            "下载全量别名库失败 (HTTP {})",
+            resp.status()
+        )));
+    }
+
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| AppError::MetadataFetchError(format!("创建临时文件失败: {e}")))?;
+    let mut written: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AppError::MetadataFetchError(format!("读取全量别名库失败: {e}")))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| AppError::MetadataFetchError(format!("写入全量别名库失败: {e}")))?;
+        written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|e| AppError::MetadataFetchError(format!("写入全量别名库失败: {e}")))?;
+    drop(file);
+
+    if written < BANGUMI_ALIAS_DB_MIN_BYTES {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(AppError::MetadataFetchError(format!(
+            "全量别名库大小异常: {written} 字节"
+        )));
+    }
+    std::fs::rename(&tmp_path, &db_path)
+        .map_err(|e| AppError::MetadataFetchError(format!("替换全量别名库失败: {e}")))?;
+    Ok(())
 }
 
 #[cfg(feature = "metadata")]
@@ -2048,6 +2219,32 @@ fn is_supplemental_video_path(path: &Path) -> bool {
 #[cfg(all(test, feature = "metadata"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bangumi_alias_db_points_at_weekly_release() {
+        assert_eq!(
+            BANGUMI_ALIAS_DB_URL,
+            "https://github.com/ModerRAS/anime-organizer/releases/download/bangumi-db-latest/bangumi.db"
+        );
+        assert_eq!(
+            BANGUMI_ALIAS_DB_TTL,
+            std::time::Duration::from_secs(7 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn bangumi_alias_db_freshness_checks_size_and_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bangumi.db");
+        // 不存在 → 需要下载
+        assert!(!bangumi_alias_db_is_fresh(&path));
+        // 明显偏小 → 视为下载不完整
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        assert!(!bangumi_alias_db_is_fresh(&path));
+        // 大小正常且刚写入 → 直接复用
+        std::fs::write(&path, vec![0u8; BANGUMI_ALIAS_DB_MIN_BYTES as usize]).unwrap();
+        assert!(bangumi_alias_db_is_fresh(&path));
+    }
 
     #[test]
     fn animeatlas_download_uses_fixed_release_url() {
